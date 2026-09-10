@@ -73,4 +73,4 @@ docs/              requirements, design, internals, test plan, project plan
 
 ## License
 
-Not chosen yet.
+MIT. See [LICENSE](LICENSE).
