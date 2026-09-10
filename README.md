@@ -15,10 +15,6 @@
 
 <h1 align="center">GaribalDB</h1>
 
-<p align="center">
-  <em>A relational database, written from nothing.</em>
-</p>
-
 ---
 
 A single-node SQL database server. Clients connect over TCP and send SQL. Tables are B-trees in
