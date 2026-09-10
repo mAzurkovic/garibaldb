@@ -37,7 +37,7 @@ No `JOIN`, no indexes, no aggregates, no replication, no authentication.
 
 ## Status
 
-Milestone 1 of 12 done. The protocol crate is complete and tested.
+Milestone 2 of 12 done. The server accepts connections and speaks the protocol. It knows no SQL yet.
 Milestone 8 is the first one that looks like a database.
 See [docs/projectplan.md](docs/projectplan.md).
 
