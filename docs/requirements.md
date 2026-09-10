@@ -125,6 +125,7 @@ Design decisions belong in `design.md`. Acceptance tests belong in `testplan.md`
   - storage full
   - transaction aborted
   - schema change while a transaction is open
+  - too many connections
 
 ### 2.10 CLI client
 

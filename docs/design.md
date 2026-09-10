@@ -219,6 +219,7 @@ and borrows workspace only while it sorts. This keeps `[NFR13]` and `[NFR10]` bo
 |---|---|---|
 | `serde`, `serde_json` | server, CLI | Protocol messages and `catalog.json` |
 | `crc32fast` | server | WAL frame checksums |
+| `log` | server | Log macros. No transitive crates. The backend is written here. |
 | `rustyline` | CLI | Line editing, history, multi-line input |
 
 Everything else is `std`.

@@ -19,6 +19,7 @@ pub enum ErrorCode {
     TxnAborted,
     SchemaChangeInTxn,
     LockTimeout,
+    TooManyConnections,
 }
 
 impl ErrorCode {
@@ -35,6 +36,7 @@ impl ErrorCode {
             ErrorCode::TxnAborted => "TXN_ABORTED",
             ErrorCode::SchemaChangeInTxn => "SCHEMA_CHANGE_IN_TXN",
             ErrorCode::LockTimeout => "LOCK_TIMEOUT",
+            ErrorCode::TooManyConnections => "TOO_MANY_CONNECTIONS",
         }
     }
 }
@@ -71,7 +73,7 @@ impl std::error::Error for DbError {}
 mod tests {
     use super::*;
 
-    const ALL: [(ErrorCode, &str); 10] = [
+    const ALL: [(ErrorCode, &str); 11] = [
         (ErrorCode::SyntaxError, "SYNTAX_ERROR"),
         (ErrorCode::UnknownTable, "UNKNOWN_TABLE"),
         (ErrorCode::UnknownColumn, "UNKNOWN_COLUMN"),
@@ -82,6 +84,7 @@ mod tests {
         (ErrorCode::TxnAborted, "TXN_ABORTED"),
         (ErrorCode::SchemaChangeInTxn, "SCHEMA_CHANGE_IN_TXN"),
         (ErrorCode::LockTimeout, "LOCK_TIMEOUT"),
+        (ErrorCode::TooManyConnections, "TOO_MANY_CONNECTIONS"),
     ];
 
     #[test]

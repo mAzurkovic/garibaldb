@@ -94,7 +94,7 @@ classDiagram
     class Config {
         +data_dir: PathBuf
         +port: u16
-        +mem_limit: usize
+        +mem_limit: u64
         +wal_max_bytes: u64
         +lock_timeout_ms: u64
     }
@@ -494,6 +494,7 @@ classDiagram
         TXN_ABORTED
         SCHEMA_CHANGE_IN_TXN
         LOCK_TIMEOUT
+        TOO_MANY_CONNECTIONS
     }
     class DbError {
         +code: ErrorCode

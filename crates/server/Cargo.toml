@@ -1,0 +1,13 @@
+[package]
+name = "server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "garibald"
+path = "src/main.rs"
+
+[dependencies]
+protocol = { path = "../protocol" }
+log.workspace = true
