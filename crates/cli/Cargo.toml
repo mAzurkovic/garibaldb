@@ -1,0 +1,18 @@
+[package]
+name = "cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "garibaldb"
+path = "src/main.rs"
+
+[dependencies]
+protocol = { path = "../protocol" }
+rustyline.workspace = true
+ctrlc.workspace = true

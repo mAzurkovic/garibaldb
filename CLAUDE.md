@@ -33,7 +33,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, then clippy w
 crates/protocol/   the wire contract: messages, Value/DataType/Decimal, error codes.
                    No engine code, no std::fs. Depended on by both server and cli.
 crates/server/     the engine and the `garibald` binary.
-crates/cli/        the `garibal` binary — not created yet (milestone 3).
+crates/cli/        the `garibaldb` binary — not created yet (milestone 3).
 docs/              requirements, design, internals, test plan, project plan (see below)
 .specs/            per-milestone task checklists, one directory per milestone
 ```

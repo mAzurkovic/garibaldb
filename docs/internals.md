@@ -51,7 +51,7 @@ crates/
         overflow.rs      OverflowChain
         codec.rs         encode_row, decode_row
         extsort.rs       ExternalSort, RunFile
-  cli/                   binary: garibal
+  cli/                   binary: garibaldb
     src/
       main.rs            Cli
       conn.rs            Connection

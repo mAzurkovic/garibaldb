@@ -12,7 +12,7 @@ Version 1. Date 2026-09-09.
 
 ```mermaid
 graph TD
-  CLI["garibal-cli"]
+  CLI["garibaldb"]
 
   subgraph CONN["Connection layer (one thread per client)"]
     NET["Listener"]
@@ -221,6 +221,7 @@ and borrows workspace only while it sorts. This keeps `[NFR13]` and `[NFR10]` bo
 | `crc32fast` | server | WAL frame checksums |
 | `log` | server | Log macros. No transitive crates. The backend is written here. |
 | `rustyline` | CLI | Line editing, history, multi-line input |
+| `ctrlc` | CLI | The Ctrl-C handler. `std` has none, and `rustyline` sees Ctrl-C only at the prompt |
 
 Everything else is `std`.
 

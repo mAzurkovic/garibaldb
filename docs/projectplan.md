@@ -86,7 +86,7 @@ through a JSON round trip.
 **Goal.** A usable client. From here you never need `nc` again.
 
 **Scope**
-- `crates/cli`, binary `garibal`.
+- `crates/cli`, binary `garibaldb`.
 - `conn.rs`: `Connection`. Startup, query, cancel on a second socket.
 - `repl.rs`: `Repl`. `rustyline` for history and editing. Collect lines until a `;`.
 - `render.rs`: `TableWriter`. Aligned columns, `NULL` shown, rows printed as they arrive.
@@ -96,7 +96,7 @@ through a JSON round trip.
 
 **Requirements.** [FR71]-[FR80]
 
-**Done when.** `garibal -c "SELECT 1"` prints the server error and stops with a non-zero code.
+**Done when.** `garibaldb -c "SELECT 1"` prints the server error and stops with a non-zero code.
 Ctrl-C during a slow answer returns the prompt with the connection open.
 
 **Depends on.** M2.
