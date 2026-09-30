@@ -37,8 +37,8 @@ No `JOIN`, no indexes, no aggregates, no replication, no authentication.
 
 ## Status
 
-Milestone 2 of 12 done. The server accepts connections and speaks the protocol. It knows no SQL yet.
-Milestone 8 is the first one that looks like a database.
+Milestone 3 of 12 done. The client connects to the server and speaks the protocol. Neither knows
+any SQL yet. Milestone 8 is the first one that looks like a database.
 See [docs/projectplan.md](docs/projectplan.md).
 
 ## Build
