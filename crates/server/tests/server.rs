@@ -225,7 +225,7 @@ fn a_cancel_matches_only_with_the_right_secret() {
 /// closes, so a client can tell a busy server from a full disk.
 #[test]
 fn a_connection_past_the_cap_is_refused() {
-    let server = Server::start_with(&["--max-connections", "2"]);
+    let mut server = Server::start_with(&["--max-connections", "2"]);
 
     // Hold both slots open. A closed connection would free one.
     let mut held = Vec::new();
@@ -239,8 +239,11 @@ fn a_connection_past_the_cap_is_refused() {
     assert_eq!(code_of(&extra.expect()), ErrorCode::TooManyConnections);
     assert_eq!(extra.recv(), None, "the server closes the extra connection");
 
-    // A slot that frees up lets the next client in.
+    // A slot that frees up lets the next client in. Dropping the connection
+    // only starts the release, so the test waits for the line that the server
+    // writes once the slot is back.
     held.pop();
+    wait_log(&mut server.log, "closed");
     let mut after = server.connect();
     let (conn_id, _) = after.start_up();
     assert!(conn_id > 0);

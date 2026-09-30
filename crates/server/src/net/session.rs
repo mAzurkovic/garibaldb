@@ -61,11 +61,11 @@ impl Session {
         }
     }
 
-    /// Frees the connection. See [FR65] and [FR81].
+    /// Frees the connection. The listener logs the close, because the line
+    /// must follow the slot that the connection held. See [FR65].
     fn on_disconnect(&mut self, cancels: &CancelRegistry) {
         self.rollback_open_transaction();
         cancels.unregister(self.conn_id);
-        log::info!("connection {} closed", self.conn_id);
     }
 
     /// [FR65] rolls back the open transaction here. Milestone 10 adds the

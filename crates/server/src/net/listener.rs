@@ -74,9 +74,12 @@ impl Server {
         log::info!("connection {conn_id} from {peer}");
         let cancels = Arc::clone(&self.cancels);
         // `slot` moves into the thread, so a panicking session frees it too.
+        // The log follows the slot, so the line means that the server has room
+        // again and not merely that the client left. See [FR81].
         std::thread::spawn(move || {
             session::serve(&stream, conn_id, &cancels);
             drop(slot);
+            log::info!("connection {conn_id} closed");
         });
     }
 }
