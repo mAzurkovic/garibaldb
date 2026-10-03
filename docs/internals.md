@@ -16,7 +16,7 @@ crates/
       message.rs         ClientMsg, ServerMsg
       value.rs           Value, DataType, Decimal
       error.rs           ErrorCode, DbError
-  server/                binary: garibald
+  server/                binary: garibaldb-server
     src/
       main.rs
       config.rs

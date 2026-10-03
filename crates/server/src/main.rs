@@ -1,4 +1,4 @@
-//! The `garibald` server. See `docs/design.md`.
+//! The `garibaldb-server` binary. See `docs/design.md`.
 
 mod config;
 mod logging;
@@ -13,13 +13,13 @@ fn main() {
     let config = match Config::from_args() {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("garibald: {e}");
+            eprintln!("garibaldb-server: {e}");
             std::process::exit(2);
         }
     };
 
     if let Err(e) = logging::init() {
-        eprintln!("garibald: {e}");
+        eprintln!("garibaldb-server: {e}");
         std::process::exit(2);
     }
 
@@ -42,9 +42,9 @@ fn main() {
 
     // [FR83] for this milestone. Recovery arrives in milestone 9.
     log::info!(
-        "garibald listening on port {port}, data in {}",
+        "garibaldb-server listening on port {port}, data in {}",
         config.data_dir.display()
     );
     server.run();
-    log::info!("garibald stopped");
+    log::info!("garibaldb-server stopped");
 }

@@ -1,6 +1,6 @@
 //! The client against a server that answers from a script.
 //!
-//! A stub stands in for `garibald`, which knows no SQL until milestone 4 and
+//! A stub stands in for `garibaldb-server`, which knows no SQL until milestone 4 and
 //! so cannot send a row or hold an answer back. The stub can do both, which is
 //! what [FR75] and [FR79] need. It also keeps `cli` free of any dependency on
 //! `server`.

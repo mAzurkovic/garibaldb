@@ -105,10 +105,10 @@ mod tests {
     #[test]
     fn data_dir_takes_the_next_argument() {
         assert_eq!(
-            parse(&["--data-dir", "/var/lib/garibald"])
+            parse(&["--data-dir", "/var/lib/garibaldb"])
                 .unwrap()
                 .data_dir,
-            PathBuf::from("/var/lib/garibald")
+            PathBuf::from("/var/lib/garibaldb")
         );
     }
 

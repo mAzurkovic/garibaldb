@@ -3,7 +3,7 @@
 Source: `docs/projectplan.md` M2. Types: `docs/internals.md` section 1.
 Requirements: [FR61]-[FR66], [FR81]-[FR83], [NFR14], [NFR20], [NFR21].
 
-Crate `crates/server`, binary `garibald`. It knows no SQL. Every `Query` answers
+Crate `crates/server`, binary `garibaldb-server`. It knows no SQL. Every `Query` answers
 `Error(UNKNOWN_TABLE)` until milestone 4.
 
 Settled before this list. Do not reopen.
@@ -14,7 +14,7 @@ Settled before this list. Do not reopen.
 
 ## 1. Crate skeleton and config [serial]
 
-- [x] 1.1 Add `crates/server` to the workspace members. `Cargo.toml` depends on `protocol` and `log`. Binary name `garibald`. `cargo check` passes.
+- [x] 1.1 Add `crates/server` to the workspace members. `Cargo.toml` depends on `protocol` and `log`. Binary name `garibaldb-server`. `cargo check` passes.
 - [x] 1.2 Add `Config` to `src/config.rs`. Fields `data_dir`, `port`, `mem_limit`, `wal_max_bytes`, `lock_timeout_ms`, `max_connections`. `Default` gives port 5432, 1 GB, 8 GB, 5000 ms, 100.
 - [x] 1.3 Add `Config::from_args`. Reads `--data-dir`, `--port`, `--max-connections` with `std::env::args`. An unknown flag returns an error. No `clap`.
 - [x] 1.4 Add `src/main.rs`. Reads the config, starts the logger, runs the server. A bad flag prints the error and stops with code 2.

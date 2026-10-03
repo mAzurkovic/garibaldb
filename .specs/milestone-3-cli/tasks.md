@@ -137,7 +137,7 @@ Settled before this list. Do not reopen.
 
 ## Done when
 
-- `garibaldb -c "SELECT 1"` against a real `garibald` prints the server error and stops with a
+- `garibaldb -c "SELECT 1"` against a real `garibaldb-server` prints the server error and stops with a
   non-zero code.
 - A statement typed over more than one line runs when the `;` arrives.
 - Ctrl-C during a slow answer returns the prompt with the connection open.

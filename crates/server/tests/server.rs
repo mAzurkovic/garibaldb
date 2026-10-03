@@ -1,7 +1,7 @@
 //! The server over a real socket, seen from outside the process.
 //!
 //! `server` is a binary crate, so a test cannot import its modules. Each test
-//! therefore starts the `garibald` binary on port 0 and speaks the protocol
+//! therefore starts the `garibaldb-server` binary on port 0 and speaks the protocol
 //! over TCP, which is what a client does. See [FR61] to [FR66] and [NFR14].
 //!
 //! Nothing here sleeps. The binary logs the bound port before it accepts, so
@@ -13,7 +13,7 @@ use std::process::{Child, ChildStderr, Command, Stdio};
 
 use protocol::{ClientMsg, ErrorCode, PROTOCOL_VERSION, ServerMsg, TxState};
 
-/// One `garibald` process on a port that the operating system chose. `Drop`
+/// One `garibaldb-server` process on a port that the operating system chose. `Drop`
 /// kills it, so a failed test leaves no port held.
 struct Server {
     child: Child,
@@ -31,13 +31,13 @@ impl Server {
     /// The same, with more flags. Used to make the connection cap small
     /// enough to reach in a test.
     fn start_with(flags: &[&str]) -> Server {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_garibald"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_garibaldb-server"))
             .args(["--port", "0"])
             .args(flags)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("the garibald binary starts");
+            .expect("the garibaldb-server binary starts");
         let mut log = BufReader::new(child.stderr.take().expect("stderr is a pipe"));
         let line = wait_log(&mut log, "listening on port");
         let port = port_of(&line).unwrap_or_else(|| panic!("no port in {line:?}"));

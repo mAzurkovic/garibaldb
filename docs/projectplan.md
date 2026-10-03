@@ -64,7 +64,7 @@ through a JSON round trip.
 **Goal.** A server that accepts connections and answers messages. It knows no SQL.
 
 **Scope**
-- `crates/server`, binary `garibald`.
+- `crates/server`, binary `garibaldb-server`.
 - `config.rs`: data directory, port, memory limit, WAL limit, lock timeout.
 - `net/listener.rs`: `Server`. `TcpListener`, one `std::thread` for each connection.
 - `net/session.rs`: `Session`. Startup handshake, message loop, disconnect.

@@ -54,7 +54,7 @@ Needs Rust 1.85 or newer.
 
 ```
 crates/protocol/   messages, values, error codes. No engine, no I/O.
-crates/server/     the engine and the garibald binary
+crates/server/     the engine and the garibaldb-server binary
 crates/cli/        the garibaldb binary
 docs/              requirements, design, internals, test plan, project plan
 ```
