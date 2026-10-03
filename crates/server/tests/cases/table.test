@@ -1,0 +1,49 @@
+# The life of a table, in the database that a new data directory starts with.
+
+statement ok
+CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL, sold BOOLEAN, price DECIMAL(10, 2))
+
+statement error TABLE_EXISTS
+CREATE TABLE item (id INTEGER PRIMARY KEY)
+
+statement error UNKNOWN_TABLE
+DROP TABLE other
+
+# A table is keyed by one column, so it needs exactly one primary key.
+
+statement error SYNTAX_ERROR
+CREATE TABLE no_key (id INTEGER, label TEXT)
+
+statement error SYNTAX_ERROR
+CREATE TABLE two_keys (a INTEGER PRIMARY KEY, b INTEGER PRIMARY KEY)
+
+# A column name appears once, or a row could not be read back.
+
+statement error SYNTAX_ERROR
+CREATE TABLE twice (a INTEGER PRIMARY KEY, a TEXT)
+
+# The constraints of a column read in either order, and the primary key need
+# not be the first column.
+
+statement ok
+CREATE TABLE both (a INTEGER NOT NULL PRIMARY KEY)
+
+statement ok
+CREATE TABLE later (label TEXT, id INTEGER PRIMARY KEY)
+
+# A name keeps its case.
+
+statement ok
+CREATE TABLE Item (id INTEGER PRIMARY KEY)
+
+statement ok
+DROP TABLE Item
+
+statement error UNKNOWN_TABLE
+DROP TABLE Item
+
+statement ok
+DROP TABLE item
+
+statement error UNKNOWN_TABLE
+DROP TABLE item

@@ -8,10 +8,31 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
 
 use protocol::{ClientMsg, ErrorCode, PROTOCOL_VERSION, ServerMsg, Value};
+
+/// A data directory for one test, gone when it drops.
+pub struct DataDir(pub PathBuf);
+
+impl DataDir {
+    pub fn new(label: &str) -> DataDir {
+        let path = std::env::temp_dir().join(format!(
+            "garibaldb-suite-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        DataDir(path)
+    }
+}
+
+impl Drop for DataDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 /// One server process on a port that the operating system chose. `Drop` kills
 /// it, so a failed test leaves no port held.
@@ -20,10 +41,13 @@ pub struct Server {
     port: u16,
     /// The log of the process, which also reports what a `Cancel` matched.
     pub log: BufReader<ChildStderr>,
+    /// Held so the data directory outlives the server and goes with it. A
+    /// server started on a directory the test owns holds nothing here.
+    _data: Option<DataDir>,
 }
 
 impl Server {
-    /// Starts the binary on port 0 and reads the port back from its log.
+    /// Starts the binary on a data directory and a port of its own.
     pub fn start() -> Server {
         Server::start_with(&[])
     }
@@ -31,8 +55,18 @@ impl Server {
     /// The same, with more flags. Used to make the connection cap small
     /// enough to reach in a test.
     pub fn start_with(flags: &[&str]) -> Server {
+        let data = DataDir::new("server");
+        let mut server = Server::start_on(&data.0, flags);
+        server._data = Some(data);
+        server
+    }
+
+    /// Starts on a data directory the test names, so one test can stop a
+    /// server and start another on the same files.
+    pub fn start_on(data_dir: &Path, flags: &[&str]) -> Server {
         let mut child = Command::new(env!("CARGO_BIN_EXE_garibaldb-server"))
             .args(["--port", "0"])
+            .args(["--data-dir", data_dir.to_str().expect("the path is text")])
             .args(flags)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -41,7 +75,12 @@ impl Server {
         let mut log = BufReader::new(child.stderr.take().expect("stderr is a pipe"));
         let line = wait_log(&mut log, "listening on port");
         let port = port_of(&line).unwrap_or_else(|| panic!("no port in {line:?}"));
-        Server { child, port, log }
+        Server {
+            child,
+            port,
+            log,
+            _data: None,
+        }
     }
 
     /// One client connection. The listener is bound before it logs, so the
@@ -137,10 +176,14 @@ impl Conn {
     }
 }
 
+/// The database a new data directory starts with, which every suite connects
+/// to unless it makes one of its own.
+pub const DATABASE: &str = "default";
+
 pub fn startup(version: u16) -> ClientMsg {
     ClientMsg::Startup {
         version,
-        database: "shop".to_string(),
+        database: DATABASE.to_string(),
     }
 }
 
@@ -235,20 +278,7 @@ fn read_rows<'a>(
 /// The code that a case file names. The wire name is the contract, so the
 /// file spells a code the way the protocol does.
 fn error_code(name: &str) -> Option<ErrorCode> {
-    let codes = [
-        ErrorCode::SyntaxError,
-        ErrorCode::UnknownTable,
-        ErrorCode::UnknownColumn,
-        ErrorCode::TypeMismatch,
-        ErrorCode::DuplicateKey,
-        ErrorCode::NotNullViolation,
-        ErrorCode::StorageFull,
-        ErrorCode::TxnAborted,
-        ErrorCode::SchemaChangeInTxn,
-        ErrorCode::LockTimeout,
-        ErrorCode::TooManyConnections,
-    ];
-    codes.into_iter().find(|code| code.as_str() == name)
+    name.parse().ok()
 }
 
 /// The rows of an answer, written the way a case file writes them.

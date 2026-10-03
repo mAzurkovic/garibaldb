@@ -12,7 +12,7 @@ mod h1;
 
 use protocol::{ClientMsg, ErrorCode, PROTOCOL_VERSION, ServerMsg, TxState};
 
-use h1::{Conn, Server, startup, wait_log};
+use h1::{Conn, DataDir, Server, startup, wait_log};
 
 fn query() -> ClientMsg {
     ClientMsg::Query {
@@ -25,6 +25,17 @@ fn broken_query() -> ClientMsg {
     ClientMsg::Query {
         sql: "SELECT a FROM".to_string(),
     }
+}
+
+/// The kind of the `Complete` in an answer, which says the statement ran.
+fn kind_of(answer: &[ServerMsg]) -> String {
+    answer
+        .iter()
+        .find_map(|msg| match msg {
+            ServerMsg::Complete { kind, .. } => Some(kind.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected a complete, got {answer:?}"))
 }
 
 fn code_of(msg: &ServerMsg) -> ErrorCode {
@@ -170,4 +181,99 @@ fn a_malformed_statement_answers_a_syntax_error_with_its_position() {
             tx: TxState::None,
         }
     );
+}
+
+/// [FR6] and [FR10]. A schema outlives the process that made it, which is
+/// what writing the catalog to disk is for.
+#[test]
+fn a_table_survives_a_restart() {
+    let data = DataDir::new("restart");
+
+    let first = Server::start_on(&data.0, &[]);
+    let mut conn = first.connect();
+    conn.start_up();
+    assert_eq!(
+        kind_of(&conn.run("CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")),
+        "CREATE TABLE"
+    );
+    drop(conn);
+    drop(first);
+
+    let second = Server::start_on(&data.0, &[]);
+    let mut conn = second.connect();
+    conn.start_up();
+    // A table the restart lost would answer UNKNOWN_TABLE here.
+    assert_eq!(kind_of(&conn.run("DROP TABLE item")), "DROP TABLE");
+    assert_eq!(
+        code_of(&conn.run("DROP TABLE item")[0]),
+        ErrorCode::UnknownTable
+    );
+}
+
+/// [FR5]. Two connections on one server see their own database and no other.
+#[test]
+fn a_client_sees_only_the_database_it_connected_to() {
+    let server = Server::start();
+    let mut first = server.connect();
+    first.start_up();
+    assert_eq!(
+        kind_of(&first.run("CREATE DATABASE other")),
+        "CREATE DATABASE"
+    );
+    assert_eq!(
+        kind_of(&first.run("CREATE TABLE here (id INTEGER PRIMARY KEY)")),
+        "CREATE TABLE"
+    );
+
+    let mut second = server.connect();
+    second.send(&ClientMsg::Startup {
+        version: PROTOCOL_VERSION,
+        database: "other".to_string(),
+    });
+    assert!(matches!(second.expect(), ServerMsg::Ready { .. }));
+    assert_eq!(
+        code_of(&second.run("DROP TABLE here")[0]),
+        ErrorCode::UnknownTable,
+        "the table belongs to the other database"
+    );
+}
+
+/// A database that is not there closes the connection, the way a protocol
+/// version the server does not speak closes it.
+#[test]
+fn a_startup_on_a_database_that_is_not_there_is_refused() {
+    let server = Server::start();
+    let mut conn = server.connect();
+    conn.send(&ClientMsg::Startup {
+        version: PROTOCOL_VERSION,
+        database: "missing".to_string(),
+    });
+    assert_eq!(code_of(&conn.expect()), ErrorCode::UnknownDatabase);
+    assert_eq!(conn.recv(), None, "the server closes the connection");
+}
+
+/// [FR4]. The database under a connection cannot be deleted while it holds
+/// it, and can be once it lets go.
+#[test]
+fn a_database_cannot_be_dropped_while_a_client_holds_it() {
+    let mut server = Server::start();
+    let mut owner = server.connect();
+    owner.start_up();
+    owner.run("CREATE DATABASE shop");
+
+    let mut guest = server.connect();
+    guest.send(&ClientMsg::Startup {
+        version: PROTOCOL_VERSION,
+        database: "shop".to_string(),
+    });
+    assert!(matches!(guest.expect(), ServerMsg::Ready { .. }));
+    assert_eq!(
+        code_of(&owner.run("DROP DATABASE shop")[0]),
+        ErrorCode::DatabaseInUse
+    );
+
+    // The guest leaves, and the server logs the close once the slot is back.
+    drop(guest);
+    wait_log(&mut server.log, "closed");
+    assert_eq!(kind_of(&owner.run("DROP DATABASE shop")), "DROP DATABASE");
 }

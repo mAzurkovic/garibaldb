@@ -1,0 +1,43 @@
+# The life of a database. The connection running these holds the database that
+# a new data directory starts with, so it can make and delete others.
+
+statement ok
+CREATE DATABASE shop
+
+statement error DATABASE_EXISTS
+CREATE DATABASE shop
+
+statement ok
+DROP DATABASE shop
+
+statement error UNKNOWN_DATABASE
+DROP DATABASE shop
+
+# A name keeps its case, but two names that differ only by case cannot both
+# exist, because a directory name reaches a filesystem that may fold it.
+
+statement ok
+CREATE DATABASE shop
+
+statement error DATABASE_EXISTS
+CREATE DATABASE Shop
+
+statement error UNKNOWN_DATABASE
+DROP DATABASE SHOP
+
+# The database under this connection cannot go while the connection holds it.
+
+statement error DATABASE_IN_USE
+DROP DATABASE default
+
+# A table lives in the database that made it, and no other connection state
+# reaches it, so dropping the database takes the table with it.
+
+statement ok
+CREATE TABLE here (id INTEGER PRIMARY KEY)
+
+statement error TABLE_EXISTS
+CREATE TABLE here (id INTEGER PRIMARY KEY)
+
+statement ok
+DROP DATABASE shop

@@ -126,6 +126,10 @@ Design decisions belong in `design.md`. Acceptance tests belong in `testplan.md`
   - transaction aborted
   - schema change while a transaction is open
   - too many connections
+  - a database that already exists
+  - a table that already exists
+  - a database that a client is still connected to
+  - a database that does not exist
 
 ### 2.10 CLI client
 

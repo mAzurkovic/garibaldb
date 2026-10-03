@@ -3,6 +3,8 @@
 //! The serde form of an [`ErrorCode`] is its screaming-snake name. The name is
 //! the wire contract, so a new code never renumbers an old one.
 
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 
 /// A stable code for a failure. See [FR68] and [FR70].
@@ -20,9 +22,33 @@ pub enum ErrorCode {
     SchemaChangeInTxn,
     LockTimeout,
     TooManyConnections,
+    DatabaseExists,
+    TableExists,
+    DatabaseInUse,
+    UnknownDatabase,
 }
 
 impl ErrorCode {
+    /// Every code. A name reads back through this, so a new code needs no
+    /// second table anywhere.
+    pub const ALL: [ErrorCode; 15] = [
+        ErrorCode::SyntaxError,
+        ErrorCode::UnknownTable,
+        ErrorCode::UnknownColumn,
+        ErrorCode::TypeMismatch,
+        ErrorCode::DuplicateKey,
+        ErrorCode::NotNullViolation,
+        ErrorCode::StorageFull,
+        ErrorCode::TxnAborted,
+        ErrorCode::SchemaChangeInTxn,
+        ErrorCode::LockTimeout,
+        ErrorCode::TooManyConnections,
+        ErrorCode::DatabaseExists,
+        ErrorCode::TableExists,
+        ErrorCode::DatabaseInUse,
+        ErrorCode::UnknownDatabase,
+    ];
+
     /// The wire name of the code. Equal to the serde form.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -37,7 +63,23 @@ impl ErrorCode {
             ErrorCode::SchemaChangeInTxn => "SCHEMA_CHANGE_IN_TXN",
             ErrorCode::LockTimeout => "LOCK_TIMEOUT",
             ErrorCode::TooManyConnections => "TOO_MANY_CONNECTIONS",
+            ErrorCode::DatabaseExists => "DATABASE_EXISTS",
+            ErrorCode::TableExists => "TABLE_EXISTS",
+            ErrorCode::DatabaseInUse => "DATABASE_IN_USE",
+            ErrorCode::UnknownDatabase => "UNKNOWN_DATABASE",
         }
+    }
+}
+
+impl FromStr for ErrorCode {
+    type Err = String;
+
+    /// Reads a wire name. The name is the contract, so nothing else reads.
+    fn from_str(name: &str) -> Result<ErrorCode, String> {
+        ErrorCode::ALL
+            .into_iter()
+            .find(|code| code.as_str() == name)
+            .ok_or_else(|| format!("unknown error code: {name}"))
     }
 }
 
@@ -73,7 +115,7 @@ impl std::error::Error for DbError {}
 mod tests {
     use super::*;
 
-    const ALL: [(ErrorCode, &str); 11] = [
+    const NAMES: [(ErrorCode, &str); 15] = [
         (ErrorCode::SyntaxError, "SYNTAX_ERROR"),
         (ErrorCode::UnknownTable, "UNKNOWN_TABLE"),
         (ErrorCode::UnknownColumn, "UNKNOWN_COLUMN"),
@@ -85,18 +127,22 @@ mod tests {
         (ErrorCode::SchemaChangeInTxn, "SCHEMA_CHANGE_IN_TXN"),
         (ErrorCode::LockTimeout, "LOCK_TIMEOUT"),
         (ErrorCode::TooManyConnections, "TOO_MANY_CONNECTIONS"),
+        (ErrorCode::DatabaseExists, "DATABASE_EXISTS"),
+        (ErrorCode::TableExists, "TABLE_EXISTS"),
+        (ErrorCode::DatabaseInUse, "DATABASE_IN_USE"),
+        (ErrorCode::UnknownDatabase, "UNKNOWN_DATABASE"),
     ];
 
     #[test]
     fn code_writes_its_screaming_snake_name() {
-        for (code, name) in ALL {
+        for (code, name) in NAMES {
             assert_eq!(serde_json::to_string(&code).unwrap(), format!("\"{name}\""));
         }
     }
 
     #[test]
     fn code_reads_back_from_its_name() {
-        for (code, name) in ALL {
+        for (code, name) in NAMES {
             let read: ErrorCode = serde_json::from_str(&format!("\"{name}\"")).unwrap();
             assert_eq!(read, code);
         }
@@ -104,8 +150,31 @@ mod tests {
 
     #[test]
     fn as_str_matches_the_serde_name() {
-        for (code, name) in ALL {
+        for (code, name) in NAMES {
             assert_eq!(code.as_str(), name);
+        }
+    }
+
+    #[test]
+    fn every_code_sits_in_the_table_that_names_it() {
+        assert_eq!(ErrorCode::ALL.len(), NAMES.len());
+        for (code, _) in NAMES {
+            assert!(ErrorCode::ALL.contains(&code), "{code} is missing from ALL");
+        }
+    }
+
+    #[test]
+    fn a_code_reads_back_from_its_wire_name() {
+        for (code, name) in NAMES {
+            assert_eq!(name.parse::<ErrorCode>().unwrap(), code);
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_code_fails_to_parse() {
+        for name in ["", "NO_SUCH_CODE", "SyntaxError", "syntax_error"] {
+            let e = name.parse::<ErrorCode>().unwrap_err();
+            assert!(e.contains("unknown error code"), "{name:?}: {e}");
         }
     }
 

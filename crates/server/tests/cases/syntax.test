@@ -1,19 +1,6 @@
-# Every statement form of the grammar. Each one parses, reaches the executor,
-# and finds no table, because the catalog arrives in milestone 5 and the
-# executor in milestone 8. A form that stops answering UNKNOWN_TABLE here is a
-# form that started running.
-
-statement error UNKNOWN_TABLE
-CREATE DATABASE shop
-
-statement error UNKNOWN_TABLE
-DROP DATABASE shop
-
-statement error UNKNOWN_TABLE
-CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL, sold BOOLEAN, price DECIMAL(10, 2))
-
-statement error UNKNOWN_TABLE
-DROP TABLE item
+# Every statement form that the executor has not reached yet. Each one parses,
+# so the answer is about the missing executor and never about the grammar. A
+# form that stops answering UNKNOWN_TABLE here is a form that started running.
 
 statement error UNKNOWN_TABLE
 INSERT INTO item (id, label) VALUES (1, 'a'), (2, 'b'), (3, NULL)
@@ -49,8 +36,7 @@ SELECT id
 FROM item
 WHERE id = 1
 
-# A keyword is case-insensitive. An identifier is not, but nothing here reads
-# an identifier yet.
+# A keyword is case-insensitive.
 
 statement error UNKNOWN_TABLE
 select * from item where id is null

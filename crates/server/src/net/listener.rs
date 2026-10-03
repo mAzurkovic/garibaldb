@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use protocol::error::ErrorCode;
 use protocol::message::ServerMsg;
 
+use crate::catalog::registry::Registry;
 use crate::config::Config;
 use crate::net::cancel::CancelRegistry;
 use crate::net::session;
@@ -26,18 +27,26 @@ pub struct Server {
     /// The count of live connections.
     live: Arc<AtomicUsize>,
     cancels: Arc<CancelRegistry>,
+    /// Every database under the data directory.
+    databases: Arc<Registry>,
 }
 
 impl Server {
     /// Binds the port of the config. Port 0 takes any free port, which
     /// [`Server::local_addr`] then reports.
     pub fn bind(config: &Config) -> io::Result<Server> {
+        let databases = Registry::new(&config.data_dir)?;
+        databases.bootstrap()?;
+        // A crash can leave a table file that no catalog names. It is dead
+        // weight, and milestone 6 would read it as a table.
+        databases.sweep()?;
         Ok(Server {
             listener: TcpListener::bind(("0.0.0.0", config.port))?,
             max_connections: config.max_connections,
             next_conn_id: AtomicU64::new(1),
             live: Arc::new(AtomicUsize::new(0)),
             cancels: Arc::new(CancelRegistry::new()),
+            databases: Arc::new(databases),
         })
     }
 
@@ -73,11 +82,12 @@ impl Server {
         }
         log::info!("connection {conn_id} from {peer}");
         let cancels = Arc::clone(&self.cancels);
+        let databases = Arc::clone(&self.databases);
         // `slot` moves into the thread, so a panicking session frees it too.
         // The log follows the slot, so the line means that the server has room
         // again and not merely that the client left. See [FR81].
         std::thread::spawn(move || {
-            session::serve(&stream, conn_id, &cancels);
+            session::serve(&stream, conn_id, &cancels, &databases);
             drop(slot);
             log::info!("connection {conn_id} closed");
         });

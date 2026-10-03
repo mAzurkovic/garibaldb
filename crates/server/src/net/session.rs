@@ -6,10 +6,13 @@
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 
 use protocol::error::ErrorCode;
 use protocol::message::{ClientMsg, PROTOCOL_VERSION, ServerMsg, TxState};
 
+use crate::catalog::ddl;
+use crate::catalog::registry::{Connected, Registry};
 use crate::net::cancel::{CancelHandle, CancelRegistry, new_secret};
 use crate::sql::parser;
 
@@ -19,9 +22,9 @@ pub struct Session {
     /// The secret of this connection. It reaches the wire as a string, because
     /// a JSON number loses digits above 2^53.
     pub secret: u64,
-    /// The database that `Startup` named. Milestone 5 opens it.
-    pub database: String,
-    /// The flag that a `Cancel` on a second connection sets. See [FR66].
+    /// The one database this connection sees. See [FR5]. Dropping it frees
+    /// the database for a `DROP DATABASE`.
+    pub held: Connected,
     /// The flag that a `Cancel` on a second connection sets. The operators
     /// read it between rows in milestone 11, so nothing reads it before then.
     #[allow(dead_code)]
@@ -30,12 +33,12 @@ pub struct Session {
 
 impl Session {
     /// Registers the connection and takes its cancel flag.
-    fn start(conn_id: u64, database: String, cancels: &CancelRegistry) -> Session {
+    fn start(conn_id: u64, held: Connected, cancels: &CancelRegistry) -> Session {
         let secret = new_secret();
         Session {
             conn_id,
             secret,
-            database,
+            held,
             cancel: cancels.register(conn_id, secret),
         }
     }
@@ -51,14 +54,39 @@ impl Session {
     }
 
     /// Answers each message until `Close`, a write error, a read error, or EOF.
-    fn run(&self, stream: &TcpStream, lines: impl Iterator<Item = io::Result<String>>) {
+    fn run(
+        &self,
+        stream: &TcpStream,
+        lines: impl Iterator<Item = io::Result<String>>,
+        registry: &Registry,
+    ) {
         for line in lines {
             // A read error ends the session, like EOF.
             let Ok(line) = line else { break };
-            let Some(answer) = answer(&line) else { break };
+            let answer = match read_line(&line) {
+                Asked::Leave => break,
+                Asked::Reply(msg) => msg,
+                Asked::Statement(sql) => self.run_statement(&sql, registry),
+            };
             if self.reply(stream, &answer).is_err() || self.reply(stream, &self.ready()).is_err() {
                 break;
             }
+        }
+    }
+
+    /// Reads one statement and runs it. A schema change runs now. A statement
+    /// on a row waits for the executor in milestone 8.
+    fn run_statement(&self, sql: &str, registry: &Registry) -> ServerMsg {
+        let statement = match parser::parse(sql) {
+            Ok(statement) => statement,
+            Err(e) => return ServerMsg::from(e),
+        };
+        match ddl::run(&statement, &self.held.db, registry) {
+            Ok(kind) => ServerMsg::Complete {
+                kind: kind.to_string(),
+                rows: 0,
+            },
+            Err(e) => ServerMsg::from(e),
         }
     }
 
@@ -82,9 +110,9 @@ impl Session {
     }
 }
 
-/// Reads the first message, then runs the loop. The connection closes when
-/// this returns.
-pub fn serve(stream: &TcpStream, conn_id: u64, cancels: &CancelRegistry) {
+/// Reads the first message, opens the database it names, then runs the loop.
+/// The connection closes when this returns.
+pub fn serve(stream: &TcpStream, conn_id: u64, cancels: &CancelRegistry, registry: &Arc<Registry>) {
     let mut lines = BufReader::new(stream).lines();
     let first = match lines.next() {
         Some(Ok(line)) => first_message(&line),
@@ -107,13 +135,23 @@ pub fn serve(stream: &TcpStream, conn_id: u64, cancels: &CancelRegistry) {
             return;
         }
     };
-    let mut session = Session::start(conn_id, database, cancels);
+    // A database that is not there closes the connection, the way a protocol
+    // version the server does not speak closes it.
+    let held = match Registry::connect(registry, &database) {
+        Ok(held) => held,
+        Err(e) => {
+            log::error!("connection {conn_id}: {e}");
+            let _ = send(stream, &ServerMsg::from(e));
+            return;
+        }
+    };
+    let mut session = Session::start(conn_id, held, cancels);
     log::info!(
         "connection {conn_id} starts up on database {}",
-        session.database
+        session.held.db.name
     );
     if session.reply(stream, &session.ready()).is_ok() {
-        session.run(stream, &mut lines);
+        session.run(stream, &mut lines, registry);
     }
     session.on_disconnect(cancels);
 }
@@ -129,8 +167,7 @@ enum First {
     Reject(ServerMsg),
 }
 
-/// Reads the first line. Only `Startup` and `Cancel` stand here. The database
-/// name travels as it comes, because databases arrive in milestone 5.
+/// Reads the first line. Only `Startup` and `Cancel` stand here.
 fn first_message(line: &str) -> First {
     match ClientMsg::from_line(line) {
         Ok(ClientMsg::Startup { version, database }) if version == PROTOCOL_VERSION => {
@@ -158,32 +195,40 @@ fn first_message(line: &str) -> First {
     }
 }
 
-/// The answer to one line of a started session. `None` means the client leaves.
-/// The caller writes `Ready` after the answer.
-///
-/// A statement that parses answers `UNKNOWN_TABLE`, because the catalog
-/// arrives in milestone 5 and the executor in milestone 8.
-fn answer(line: &str) -> Option<ServerMsg> {
-    Some(match ClientMsg::from_line(line) {
-        Ok(ClientMsg::Close) => return None,
-        Ok(ClientMsg::Query { sql }) => match parser::parse(&sql) {
-            // The statement is understood. Milestone 8 runs it.
-            Ok(_statement) => error(ErrorCode::UnknownTable, "the server holds no table"),
-            Err(e) => ServerMsg::from(e),
-        },
-        Ok(ClientMsg::Startup { .. }) => {
-            error(ErrorCode::SyntaxError, "the connection already started up")
-        }
-        Ok(ClientMsg::Cancel { .. }) => {
-            error(ErrorCode::SyntaxError, "a cancel needs a second connection")
-        }
-        // A malformed line is an error, and the connection stays open.
-        Err(e) => error(ErrorCode::SyntaxError, format!("malformed message: {e}")),
-    })
+/// What one line of a started session asks for.
+#[derive(Debug, PartialEq)]
+enum Asked {
+    /// The client leaves.
+    Leave,
+    /// A statement to run.
+    Statement(String),
+    /// The answer, which needs no database.
+    Reply(ServerMsg),
 }
 
-/// One error message with no position. A position needs a statement, which
-/// milestone 4 parses.
+/// Reads one line of a started session.
+fn read_line(line: &str) -> Asked {
+    match ClientMsg::from_line(line) {
+        Ok(ClientMsg::Close) => Asked::Leave,
+        Ok(ClientMsg::Query { sql }) => Asked::Statement(sql),
+        Ok(ClientMsg::Startup { .. }) => Asked::Reply(error(
+            ErrorCode::SyntaxError,
+            "the connection already started up",
+        )),
+        Ok(ClientMsg::Cancel { .. }) => Asked::Reply(error(
+            ErrorCode::SyntaxError,
+            "a cancel needs a second connection",
+        )),
+        // A malformed line is an error, and the connection stays open.
+        Err(e) => Asked::Reply(error(
+            ErrorCode::SyntaxError,
+            format!("malformed message: {e}"),
+        )),
+    }
+}
+
+/// One error message with no position. A position belongs to a statement, and
+/// the parser puts it there.
 fn error(code: ErrorCode, message: impl Into<String>) -> ServerMsg {
     ServerMsg::Error {
         code,
@@ -201,12 +246,20 @@ pub fn send(mut stream: &TcpStream, msg: &ServerMsg) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::testing::Dir;
 
     fn code_of(msg: &ServerMsg) -> ErrorCode {
         match msg {
             ServerMsg::Error { code, .. } => *code,
             other => panic!("expected an error, got {other:?}"),
         }
+    }
+
+    fn query(sql: &str) -> String {
+        ClientMsg::Query {
+            sql: sql.to_string(),
+        }
+        .to_line()
     }
 
     #[test]
@@ -283,11 +336,7 @@ mod tests {
 
     #[test]
     fn a_query_as_the_first_message_is_rejected() {
-        let line = ClientMsg::Query {
-            sql: "SELECT 1".to_string(),
-        }
-        .to_line();
-        let First::Reject(msg) = first_message(&line) else {
+        let First::Reject(msg) = first_message(&query("SELECT * FROM item")) else {
             panic!("expected a reject");
         };
         assert_eq!(code_of(&msg), ErrorCode::SyntaxError);
@@ -311,64 +360,17 @@ mod tests {
         }
     }
 
-    fn query(sql: &str) -> String {
-        ClientMsg::Query {
-            sql: sql.to_string(),
-        }
-        .to_line()
-    }
-
     #[test]
-    fn a_statement_that_parses_answers_unknown_table() {
-        for sql in [
-            "SELECT * FROM t",
-            "INSERT INTO t (a) VALUES (1)",
-            "CREATE TABLE t (a INTEGER PRIMARY KEY)",
-            "BEGIN READ ONLY",
-            "COMMIT",
-        ] {
-            assert_eq!(
-                code_of(&answer(&query(sql)).unwrap()),
-                ErrorCode::UnknownTable,
-                "for {sql}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_statement_that_does_not_parse_answers_a_syntax_error_and_its_position() {
-        let ServerMsg::Error {
-            code,
-            message,
-            position,
-        } = answer(&query("SELECT a FROM")).unwrap()
-        else {
-            panic!("expected an error");
-        };
-        assert_eq!(code, ErrorCode::SyntaxError);
-        assert_eq!(position, Some(14));
-        assert!(message.contains("a name"), "{message}");
-    }
-
-    #[test]
-    fn a_statement_the_grammar_has_no_form_for_answers_a_syntax_error() {
-        for sql in [
-            "SELECT 1",
-            "",
-            "DROP TABLE IF EXISTS t",
-            "SELECT a + 1 FROM t",
-        ] {
-            assert_eq!(
-                code_of(&answer(&query(sql)).unwrap()),
-                ErrorCode::SyntaxError,
-                "for {sql:?}"
-            );
-        }
+    fn a_query_is_a_statement_to_run() {
+        assert_eq!(
+            read_line(&query("SELECT * FROM item")),
+            Asked::Statement("SELECT * FROM item".to_string())
+        );
     }
 
     #[test]
     fn a_close_leaves_the_loop() {
-        assert_eq!(answer(&ClientMsg::Close.to_line()), None);
+        assert_eq!(read_line(&ClientMsg::Close.to_line()), Asked::Leave);
     }
 
     #[test]
@@ -378,7 +380,10 @@ mod tests {
             database: "shop".to_string(),
         }
         .to_line();
-        assert_eq!(code_of(&answer(&line).unwrap()), ErrorCode::SyntaxError);
+        let Asked::Reply(msg) = read_line(&line) else {
+            panic!("expected a reply");
+        };
+        assert_eq!(code_of(&msg), ErrorCode::SyntaxError);
     }
 
     #[test]
@@ -388,28 +393,29 @@ mod tests {
             secret: "1".to_string(),
         }
         .to_line();
-        assert_eq!(code_of(&answer(&line).unwrap()), ErrorCode::SyntaxError);
+        let Asked::Reply(msg) = read_line(&line) else {
+            panic!("expected a reply");
+        };
+        assert_eq!(code_of(&msg), ErrorCode::SyntaxError);
     }
 
     #[test]
     fn a_malformed_line_is_an_error_and_panics_nothing() {
         for line in ["", "{", "null", r#"{"type":"query"}"#] {
-            assert_eq!(
-                code_of(&answer(line).unwrap()),
-                ErrorCode::SyntaxError,
-                "for {line:?}"
-            );
+            let Asked::Reply(msg) = read_line(line) else {
+                panic!("expected a reply for {line:?}");
+            };
+            assert_eq!(code_of(&msg), ErrorCode::SyntaxError, "for {line:?}");
         }
     }
 
     #[test]
     fn ready_carries_the_id_the_secret_and_no_transaction() {
-        let session = Session {
-            conn_id: 3,
-            secret: u64::MAX,
-            database: "shop".to_string(),
-            cancel: CancelHandle::new(),
-        };
+        let dir = Dir::new("session-ready");
+        let (_registry, held) = dir.shop();
+        let cancels = CancelRegistry::new();
+        let mut session = Session::start(3, held, &cancels);
+        session.secret = u64::MAX;
         assert_eq!(
             session.ready(),
             ServerMsg::Ready {
@@ -422,18 +428,69 @@ mod tests {
 
     #[test]
     fn a_session_registers_its_secret_so_a_cancel_finds_it() {
+        let dir = Dir::new("session-cancel");
+        let (_registry, held) = dir.shop();
         let cancels = CancelRegistry::new();
-        let session = Session::start(5, "shop".to_string(), &cancels);
+        let session = Session::start(5, held, &cancels);
         assert!(cancels.cancel(5, session.secret));
         assert!(session.cancel.stopped());
     }
 
     #[test]
     fn a_disconnect_unregisters_the_connection() {
+        let dir = Dir::new("session-disconnect");
+        let (_registry, held) = dir.shop();
         let cancels = CancelRegistry::new();
-        let mut session = Session::start(5, "shop".to_string(), &cancels);
+        let mut session = Session::start(5, held, &cancels);
         let secret = session.secret;
         session.on_disconnect(&cancels);
         assert!(!cancels.cancel(5, secret));
+    }
+
+    #[test]
+    fn a_schema_change_answers_complete_and_names_its_kind() {
+        let dir = Dir::new("session-ddl");
+        let (registry, held) = dir.shop();
+        let cancels = CancelRegistry::new();
+        let session = Session::start(1, held, &cancels);
+        assert_eq!(
+            session.run_statement("CREATE TABLE item (id INTEGER PRIMARY KEY)", &registry),
+            ServerMsg::Complete {
+                kind: "CREATE TABLE".to_string(),
+                rows: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_statement_that_does_not_parse_answers_its_position() {
+        let dir = Dir::new("session-syntax");
+        let (registry, held) = dir.shop();
+        let cancels = CancelRegistry::new();
+        let session = Session::start(1, held, &cancels);
+        let ServerMsg::Error {
+            code,
+            message,
+            position,
+        } = session.run_statement("SELECT a FROM", &registry)
+        else {
+            panic!("expected an error");
+        };
+        assert_eq!(code, ErrorCode::SyntaxError);
+        assert_eq!(position, Some(14));
+        assert!(message.contains("a name"), "{message}");
+    }
+
+    #[test]
+    fn a_statement_on_a_row_still_answers_unknown_table() {
+        let dir = Dir::new("session-rows");
+        let (registry, held) = dir.shop();
+        let cancels = CancelRegistry::new();
+        let session = Session::start(1, held, &cancels);
+        session.run_statement("CREATE TABLE item (id INTEGER PRIMARY KEY)", &registry);
+        assert_eq!(
+            code_of(&session.run_statement("SELECT * FROM item", &registry)),
+            ErrorCode::UnknownTable
+        );
     }
 }
