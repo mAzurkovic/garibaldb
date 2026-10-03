@@ -101,8 +101,10 @@ struct Stub {
     addr: SocketAddr,
     /// Opens once the stub is holding an answer back.
     reached: Arc<Gate>,
-    /// Every message that reached the stub, on any connection.
-    seen: Arc<Mutex<Vec<ClientMsg>>>,
+    /// Every message that reached the stub, on any connection, and a signal
+    /// for a test waiting on one. A client that exits without an answer can
+    /// outrun the read that records its last message.
+    seen: Arc<(Mutex<Vec<ClientMsg>>, Condvar)>,
     gate: Arc<Gate>,
 }
 
@@ -110,7 +112,7 @@ impl Stub {
     fn start(script: Script) -> Stub {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
         let addr = listener.local_addr().expect("the bound address");
-        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new((Mutex::new(Vec::new()), Condvar::default()));
         let gate = Arc::new(Gate::default());
         let reached = Arc::new(Gate::default());
 
@@ -153,14 +155,26 @@ impl Stub {
     }
 
     fn seen(&self) -> Vec<ClientMsg> {
-        self.seen.lock().unwrap().clone()
+        self.seen.0.lock().unwrap().clone()
+    }
+
+    /// Waits until the stub has read `wanted`. A message the client sends on
+    /// its way out has no answer to prove it arrived.
+    fn wait_until_seen(&self, wanted: &ClientMsg) {
+        let (seen, arrived) = (&self.seen.0, &self.seen.1);
+        let mut seen = seen.lock().unwrap();
+        while !seen.contains(wanted) {
+            let (guard, timeout) = arrived.wait_timeout(seen, PATIENCE).unwrap();
+            assert!(!timeout.timed_out(), "the stub never read {wanted:?}");
+            seen = guard;
+        }
     }
 }
 
 fn serve(
     stream: TcpStream,
     script: &Script,
-    seen: &Mutex<Vec<ClientMsg>>,
+    seen: &(Mutex<Vec<ClientMsg>>, Condvar),
     gate: &Gate,
     reached: &Gate,
 ) {
@@ -171,7 +185,8 @@ fn serve(
         let Ok(msg) = ClientMsg::from_line(&line) else {
             return;
         };
-        seen.lock().unwrap().push(msg.clone());
+        seen.0.lock().unwrap().push(msg.clone());
+        seen.1.notify_all();
         match msg {
             ClientMsg::Startup { .. } => match &script.startup {
                 Some(msg) => send(&mut writer, msg),
@@ -613,7 +628,7 @@ fn the_prompt_leaves_when_the_input_ends() {
         .output()
         .expect("the garibaldb binary runs");
     assert_eq!(out.status.code(), Some(0));
-    assert!(stub.seen().contains(&ClientMsg::Close));
+    stub.wait_until_seen(&ClientMsg::Close);
 }
 
 /// [FR79] end to end. Ctrl-C reaches the running client as a signal, the
