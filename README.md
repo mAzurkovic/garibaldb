@@ -37,8 +37,8 @@ No `JOIN`, no indexes, no aggregates, no replication, no authentication.
 
 ## Status
 
-Milestone 4 of 12 done. The server reads SQL and reports the character that breaks a statement.
-Nothing runs a statement yet. Milestone 8 is the first one that looks like a database.
+Milestone 5 of 12 done. Databases and tables exist and survive a restart. No row does, because
+storage arrives in milestone 6. Milestone 8 is the first one that looks like a database.
 See [docs/projectplan.md](docs/projectplan.md).
 
 ## Build
