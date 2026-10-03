@@ -1,0 +1,119 @@
+# Every statement form of the grammar. Each one parses, reaches the executor,
+# and finds no table, because the catalog arrives in milestone 5 and the
+# executor in milestone 8. A form that stops answering UNKNOWN_TABLE here is a
+# form that started running.
+
+statement error UNKNOWN_TABLE
+CREATE DATABASE shop
+
+statement error UNKNOWN_TABLE
+DROP DATABASE shop
+
+statement error UNKNOWN_TABLE
+CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL, sold BOOLEAN, price DECIMAL(10, 2))
+
+statement error UNKNOWN_TABLE
+DROP TABLE item
+
+statement error UNKNOWN_TABLE
+INSERT INTO item (id, label) VALUES (1, 'a'), (2, 'b'), (3, NULL)
+
+statement error UNKNOWN_TABLE
+SELECT * FROM item
+
+statement error UNKNOWN_TABLE
+SELECT id, label FROM item WHERE id >= 2 AND label IS NOT NULL ORDER BY label DESC LIMIT 10
+
+statement error UNKNOWN_TABLE
+UPDATE item SET label = 'c', sold = true WHERE id = 1
+
+statement error UNKNOWN_TABLE
+DELETE FROM item WHERE id != 1
+
+statement error UNKNOWN_TABLE
+BEGIN
+
+statement error UNKNOWN_TABLE
+BEGIN READ ONLY
+
+statement error UNKNOWN_TABLE
+COMMIT
+
+statement error UNKNOWN_TABLE
+ROLLBACK
+
+# A statement reads across lines, because the client sends what the user typed.
+
+statement error UNKNOWN_TABLE
+SELECT id
+FROM item
+WHERE id = 1
+
+# A keyword is case-insensitive. An identifier is not, but nothing here reads
+# an identifier yet.
+
+statement error UNKNOWN_TABLE
+select * from item where id is null
+
+# Every condition the grammar holds.
+
+statement error UNKNOWN_TABLE
+SELECT * FROM item WHERE (id = 1 OR id > 5) AND NOT label = 'a'
+
+statement error UNKNOWN_TABLE
+SELECT * FROM item WHERE price <= -1.50
+
+# A statement the parser refuses names the character that broke it.
+
+statement error SYNTAX_ERROR
+SELECT FROM item
+
+statement error SYNTAX_ERROR
+SELECT a FROM
+
+statement error SYNTAX_ERROR
+SELECT 1
+
+statement error SYNTAX_ERROR
+CREATE TABLE item (id REAL)
+
+statement error SYNTAX_ERROR
+CREATE TABLE item (id DECIMAL(39, 2))
+
+statement error SYNTAX_ERROR
+INSERT INTO item (id) VALUES ('a
+
+statement error SYNTAX_ERROR
+UPDATE item SET id
+
+statement error SYNTAX_ERROR
+BEGIN READ
+
+# Out of scope, so the parser must refuse each one rather than ignore it.
+
+statement error SYNTAX_ERROR
+SELECT a FROM item JOIN other ON item.a = other.a
+
+statement error SYNTAX_ERROR
+SELECT COUNT(id) FROM item
+
+statement error SYNTAX_ERROR
+SELECT DISTINCT id FROM item
+
+statement error SYNTAX_ERROR
+SELECT id FROM item GROUP BY id
+
+statement error SYNTAX_ERROR
+SELECT id + 1 FROM item
+
+statement error SYNTAX_ERROR
+ALTER TABLE item ADD COLUMN extra INTEGER
+
+statement error SYNTAX_ERROR
+CREATE INDEX by_label ON item (label)
+
+statement error SYNTAX_ERROR
+DROP TABLE IF EXISTS item
+
+statement error SYNTAX_ERROR
+SELECT id FROM item WHERE id = ?

@@ -11,6 +11,7 @@ use protocol::error::ErrorCode;
 use protocol::message::{ClientMsg, PROTOCOL_VERSION, ServerMsg, TxState};
 
 use crate::net::cancel::{CancelHandle, CancelRegistry, new_secret};
+use crate::sql::parser;
 
 /// One connection after its handshake. See [FR64].
 pub struct Session {
@@ -159,11 +160,17 @@ fn first_message(line: &str) -> First {
 
 /// The answer to one line of a started session. `None` means the client leaves.
 /// The caller writes `Ready` after the answer.
+///
+/// A statement that parses answers `UNKNOWN_TABLE`, because the catalog
+/// arrives in milestone 5 and the executor in milestone 8.
 fn answer(line: &str) -> Option<ServerMsg> {
     Some(match ClientMsg::from_line(line) {
         Ok(ClientMsg::Close) => return None,
-        // The server knows no SQL and no table until milestone 4.
-        Ok(ClientMsg::Query { .. }) => error(ErrorCode::UnknownTable, "the server holds no table"),
+        Ok(ClientMsg::Query { sql }) => match parser::parse(&sql) {
+            // The statement is understood. Milestone 8 runs it.
+            Ok(_statement) => error(ErrorCode::UnknownTable, "the server holds no table"),
+            Err(e) => ServerMsg::from(e),
+        },
         Ok(ClientMsg::Startup { .. }) => {
             error(ErrorCode::SyntaxError, "the connection already started up")
         }
@@ -304,13 +311,59 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_query_answers_unknown_table() {
-        let line = ClientMsg::Query {
-            sql: "SELECT 1".to_string(),
+    fn query(sql: &str) -> String {
+        ClientMsg::Query {
+            sql: sql.to_string(),
         }
-        .to_line();
-        assert_eq!(code_of(&answer(&line).unwrap()), ErrorCode::UnknownTable);
+        .to_line()
+    }
+
+    #[test]
+    fn a_statement_that_parses_answers_unknown_table() {
+        for sql in [
+            "SELECT * FROM t",
+            "INSERT INTO t (a) VALUES (1)",
+            "CREATE TABLE t (a INTEGER PRIMARY KEY)",
+            "BEGIN READ ONLY",
+            "COMMIT",
+        ] {
+            assert_eq!(
+                code_of(&answer(&query(sql)).unwrap()),
+                ErrorCode::UnknownTable,
+                "for {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_statement_that_does_not_parse_answers_a_syntax_error_and_its_position() {
+        let ServerMsg::Error {
+            code,
+            message,
+            position,
+        } = answer(&query("SELECT a FROM")).unwrap()
+        else {
+            panic!("expected an error");
+        };
+        assert_eq!(code, ErrorCode::SyntaxError);
+        assert_eq!(position, Some(14));
+        assert!(message.contains("a name"), "{message}");
+    }
+
+    #[test]
+    fn a_statement_the_grammar_has_no_form_for_answers_a_syntax_error() {
+        for sql in [
+            "SELECT 1",
+            "",
+            "DROP TABLE IF EXISTS t",
+            "SELECT a + 1 FROM t",
+        ] {
+            assert_eq!(
+                code_of(&answer(&query(sql)).unwrap()),
+                ErrorCode::SyntaxError,
+                "for {sql:?}"
+            );
+        }
     }
 
     #[test]

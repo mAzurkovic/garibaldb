@@ -195,12 +195,14 @@ Design decisions belong in `design.md`. Acceptance tests belong in `testplan.md`
 | `CREATE TABLE` | `CREATE TABLE t (col type [PRIMARY KEY] [NOT NULL], ...)` |
 | `DROP TABLE` | `DROP TABLE t` |
 | `INSERT` | `INSERT INTO t (cols) VALUES (...), (...)` |
-| `SELECT` | `SELECT cols FROM t [WHERE cond] [ORDER BY col [ASC\|DESC]] [LIMIT n]` |
+| `SELECT` | `SELECT {* \| cols} FROM t [WHERE cond] [ORDER BY col [ASC\|DESC]] [LIMIT n]` |
 | `UPDATE` | `UPDATE t SET col = val, ... [WHERE cond]` |
 | `DELETE` | `DELETE FROM t [WHERE cond]` |
 | `BEGIN` | `BEGIN [READ ONLY]` |
 | `COMMIT` | `COMMIT` |
 | `ROLLBACK` | `ROLLBACK` |
+
+`*` stands for every column of the table, in the order the table holds them.
 
 Column types: `INTEGER`, `TEXT`, `BOOLEAN`, `DECIMAL(p, s)`.
 
