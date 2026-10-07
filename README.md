@@ -37,9 +37,9 @@ No `JOIN`, no indexes, no aggregates, no replication, no authentication.
 
 ## Status
 
-Milestone 7 of 12 done. Databases and tables survive a restart, and a B-tree keeps rows in key
-order on disk. No statement reaches it until the executor in milestone 8, which is the first
-milestone that looks like a database.
+Milestone 8 of 12 done. It is a database: `INSERT` and `SELECT` work, and rows survive a restart.
+No transaction and no write-ahead log yet, so a power cut can still lose a write. `ORDER BY`
+arrives in milestone 11.
 See [docs/projectplan.md](docs/projectplan.md).
 
 ## Build
