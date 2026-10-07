@@ -33,7 +33,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, then clippy w
 crates/protocol/   the wire contract: messages, Value/DataType/Decimal, error codes.
                    No engine code, no std::fs. Depended on by both server and cli.
 crates/server/     the engine and the `garibaldb-server` binary.
-crates/cli/        the `garibaldb` binary — not created yet (milestone 3).
+crates/cli/        the `garibaldb` client binary.
 docs/              requirements, design, internals, test plan, project plan (see below)
 .specs/            per-milestone task checklists, one directory per milestone
 ```
@@ -59,7 +59,7 @@ in one of these:
   suites (`[S1]`-`[S17]`), and rules like "a test MUST use the network protocol, MUST NOT read a
   data file" (`[TR3]`) and "MUST start from an empty server" (`[TR5]`).
 - **`docs/projectplan.md`** — the 12 milestones, their scope, dependencies, and "done when"
-  criteria. Current status: milestone 2 of 12 done (see README "Status" and the latest commit).
+  criteria. Current status: milestone 6 of 12 done (see README "Status" and the latest commit).
 - **`.specs/milestone-N-*/tasks.md`** — the working checklist for a given milestone, generated
   from projectplan.md. Tasks already checked `[x]` are "settled, do not reopen" — notably each
   file has a "Settled before this list" section calling out decisions not to revisit.
@@ -79,7 +79,8 @@ rather than inventing scope.
   snapshots work).
 - **Storage:** B-tree keyed by primary key, 8 KB slotted pages, fixed-size clock-eviction buffer
   pool, overflow chains for values over 2 KB. No secondary indexes — a `WHERE` not on the
-  primary key is always a full `SeqScan`.
+  primary key is always a full `SeqScan`. One buffer pool serves the whole server, because the
+  memory limit is server-wide; a `PageId` names its file by an id the pool assigns at runtime.
 - **Execution:** iterator/Volcano model (`Operator::next()` returns one row at a time); rows
   stream to the socket as they're produced, nothing buffers a full result set. `ORDER BY` on the
   primary key is free (B-tree order); any other `ORDER BY` goes through an external merge sort

@@ -37,8 +37,9 @@ No `JOIN`, no indexes, no aggregates, no replication, no authentication.
 
 ## Status
 
-Milestone 5 of 12 done. Databases and tables exist and survive a restart. No row does, because
-storage arrives in milestone 6. Milestone 8 is the first one that looks like a database.
+Milestone 6 of 12 done. Databases and tables survive a restart, and pages go to disk inside a
+fixed amount of memory. No row reaches a page until the B-tree in milestone 7. Milestone 8 is
+the first one that looks like a database.
 See [docs/projectplan.md](docs/projectplan.md).
 
 ## Build
