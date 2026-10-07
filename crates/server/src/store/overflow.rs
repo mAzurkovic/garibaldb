@@ -6,14 +6,13 @@
 use protocol::DbError;
 
 use crate::store::codec::ChainPtr;
-use crate::store::page::{
-    FileId, HEADER_SIZE, PAGE_SIZE, PageHeader, PageId, PageKind, page_u32, write_u32,
-};
+use crate::store::page::{FileId, HEADER_SIZE, PAGE_SIZE, PageHeader, PageId, PageKind};
 use crate::store::pool::BufferPool;
 use crate::store::storage_error;
 
-/// Where the bytes of a chain page begin: after the header and the link.
-const DATA_AT: usize = HEADER_SIZE + 4;
+/// Where the bytes of a chain page begin. The link to the page that follows
+/// lives in the page header, so nothing sits between it and the bytes.
+const DATA_AT: usize = HEADER_SIZE;
 
 /// How many bytes one page of a chain carries.
 pub const PER_PAGE: usize = PAGE_SIZE - DATA_AT;
@@ -32,9 +31,10 @@ pub fn write(pool: &BufferPool, file: FileId, value: &[u8]) -> Result<ChainPtr, 
             kind: PageKind::Overflow,
             slot_count: 0,
             free_offset: PAGE_SIZE as u16,
+            next,
+            prev: 0,
         }
         .write(bytes);
-        write_u32(bytes, HEADER_SIZE, next);
         bytes[DATA_AT..DATA_AT + chunk.len()].copy_from_slice(chunk);
         next = id.page_no;
     }
@@ -55,12 +55,13 @@ pub fn read(pool: &BufferPool, file: FileId, ptr: ChainPtr) -> Result<Vec<u8>, D
             return Err(storage_error("the chain ends before its value does"));
         }
         let page = pool.fetch(PageId::new(file, page_no))?;
-        if PageHeader::read(page.bytes())?.kind != PageKind::Overflow {
+        let header = PageHeader::read(page.bytes())?;
+        if header.kind != PageKind::Overflow {
             return Err(storage_error("the chain reaches a page that is not a link"));
         }
         let wanted = (len - value.len()).min(PER_PAGE);
         value.extend_from_slice(&page.bytes()[DATA_AT..DATA_AT + wanted]);
-        page_no = page_u32(page.bytes(), HEADER_SIZE);
+        page_no = header.next;
     }
     Ok(value)
 }
@@ -74,7 +75,7 @@ pub fn free(pool: &BufferPool, file: FileId, ptr: ChainPtr) -> Result<(), DbErro
         // joining it writes over the link.
         let next = {
             let page = pool.fetch(id)?;
-            page_u32(page.bytes(), HEADER_SIZE)
+            PageHeader::read(page.bytes())?.next
         };
         pool.free(id)?;
         page_no = next;
@@ -101,7 +102,9 @@ mod tests {
         let page = pool
             .fetch(PageId::new(file, page_no))
             .expect("the page fetches");
-        page_u32(page.bytes(), HEADER_SIZE)
+        PageHeader::read(page.bytes())
+            .expect("the page has a header")
+            .next
     }
 
     #[test]
@@ -192,7 +195,7 @@ mod tests {
     fn a_chain_that_reaches_another_kind_of_page_is_an_error() {
         let (_dir, pool, file) = pool("wrong-kind", 4);
         let id = pool.allocate(file).unwrap();
-        SlottedPage::init(pool.fetch(id).unwrap().bytes_mut());
+        SlottedPage::init(pool.fetch(id).unwrap().bytes_mut(), PageKind::Leaf);
         let e = read(
             &pool,
             file,

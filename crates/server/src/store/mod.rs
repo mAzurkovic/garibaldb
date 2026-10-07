@@ -8,6 +8,7 @@
 //! on it, and milestone 8 runs statements through that.
 #![allow(dead_code)]
 
+pub mod btree;
 pub mod codec;
 pub mod overflow;
 pub mod page;

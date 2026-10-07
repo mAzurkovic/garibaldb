@@ -16,10 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use protocol::DbError;
 
-use crate::store::page::{
-    FileHeader, FileId, HEADER_SIZE, PAGE_SIZE, Page, PageHeader, PageId, PageKind, page_u32,
-    write_u32,
-};
+use crate::store::page::{FileHeader, FileId, PAGE_SIZE, Page, PageHeader, PageId, PageKind};
 use crate::store::storage_error;
 
 /// The share of the memory limit that the budget gives the pool, as 640 MB
@@ -163,7 +160,7 @@ impl BufferPool {
         let taken = header.free_head;
         let next = {
             let spare = self.fetch(PageId::new(file, taken))?;
-            page_u32(spare.bytes(), HEADER_SIZE)
+            PageHeader::read(spare.bytes())?.next
         };
         header.free_head = next;
         header.write(header_page.bytes_mut());
@@ -180,14 +177,16 @@ impl BufferPool {
         {
             let mut page = self.fetch(id)?;
             let bytes = page.bytes_mut();
+            // The free list links through the page header, like a chain.
             PageHeader {
                 lsn: 0,
                 kind: PageKind::Free,
                 slot_count: 0,
                 free_offset: PAGE_SIZE as u16,
+                next: header.free_head,
+                prev: 0,
             }
             .write(bytes);
-            write_u32(bytes, HEADER_SIZE, header.free_head);
         }
         header.free_head = id.page_no;
         header.write(header_page.bytes_mut());
@@ -354,7 +353,7 @@ fn offset_of(page_no: u32) -> u64 {
 mod tests {
     use super::*;
     use crate::catalog::testing::Dir;
-    use crate::store::page::SlottedPage;
+    use crate::store::page::{HEADER_SIZE, SlottedPage, page_u32, write_u32};
 
     /// A pool of `frames` frames, and one open table file.
     fn pool(label: &str, frames: usize) -> (Dir, BufferPool, FileId) {
@@ -369,7 +368,7 @@ mod tests {
     fn stamp(pool: &BufferPool, id: PageId) {
         let mut page = pool.fetch(id).expect("the page fetches");
         let bytes = page.bytes_mut();
-        SlottedPage::init(bytes);
+        SlottedPage::init(bytes, PageKind::Leaf);
         write_u32(bytes, HEADER_SIZE, id.page_no);
     }
 
@@ -488,7 +487,7 @@ mod tests {
         let (_dir, pool, file) = pool("held-flush", 4);
         let id = pool.allocate(file).unwrap();
         let mut page = pool.fetch(id).unwrap();
-        SlottedPage::init(page.bytes_mut());
+        SlottedPage::init(page.bytes_mut(), PageKind::Leaf);
         let e = pool.flush_all().unwrap_err();
         assert!(e.message.contains("held while the pool flushes"), "{e}");
     }
