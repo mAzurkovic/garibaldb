@@ -5,6 +5,7 @@ mod config;
 mod logging;
 mod net;
 mod sql;
+mod store;
 
 use config::Config;
 use net::listener::Server;

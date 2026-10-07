@@ -294,7 +294,6 @@ classDiagram
         +catalog: Catalog
         +lock: WriteLock
         +wal: Wal
-        +pool: BufferPool
         +begin(kind) Transaction
     }
     class Transaction {
@@ -374,7 +373,7 @@ classDiagram
         +ref_bit: bool
     }
     class PageId {
-        +table_id: u32
+        +file: FileId
         +page_no: u32
     }
     class SlottedPage {
@@ -434,6 +433,11 @@ classDiagram
     ExternalSort --> RunFile
 ```
 
+- One buffer pool for the whole server, and not one for each database. `[NFR10]` caps the
+  memory of the server, and 100 databases with a pool each cannot hold inside it.
+- A `FileId` is handed out when the pool first opens a `.tbl`, and never reaches the disk. So a
+  `PageId` is unique across every database without any database needing a number of its own,
+  which would need the server-level catalog that `design.md` rules out.
 - `fetch` returns a pinned page. The caller must `unpin`. A pinned page is never evicted.
 - `evict` uses the clock method. It sweeps frames, clears a set `ref_bit`, and takes the first
   frame with a clear bit and no pins.
