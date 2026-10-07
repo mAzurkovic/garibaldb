@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 
 use protocol::{DbError, ErrorCode};
 
-use crate::catalog::{Catalog, Database, named};
+use crate::catalog::{Catalog, Database, TableDef, named};
+use crate::store::page::FileId;
+use crate::store::pool::BufferPool;
 
 /// The database a new data directory gets. A client must name a database to
 /// connect, so a directory that holds none could never be reached.
@@ -28,20 +30,35 @@ struct State {
 }
 
 /// Every database of one server.
-#[derive(Debug)]
 pub struct Registry {
     data_dir: PathBuf,
     state: Mutex<State>,
+    /// One pool for the whole server, because the memory limit is for the
+    /// whole server.
+    pool: BufferPool,
 }
 
 impl Registry {
-    /// Opens the data directory, making it when it is not there yet.
-    pub fn new(data_dir: &Path) -> io::Result<Registry> {
+    /// Opens the data directory, making it when it is not there yet. The
+    /// memory limit sizes the one pool that every database reads through.
+    pub fn new(data_dir: &Path, mem_limit: u64) -> io::Result<Registry> {
         fs::create_dir_all(data_dir)?;
         Ok(Registry {
             data_dir: data_dir.to_path_buf(),
             state: Mutex::new(State::default()),
+            pool: BufferPool::new(mem_limit),
         })
+    }
+
+    pub fn pool(&self) -> &BufferPool {
+        &self.pool
+    }
+
+    /// The file that holds the rows of a table. The pool hands out the same
+    /// id for a table it has already opened.
+    pub fn table_file(&self, database: &str, table: &TableDef) -> Result<FileId, DbError> {
+        self.pool
+            .open(&self.data_dir.join(database).join(table.file_name()))
     }
 
     /// Takes a database for one connection. A client sees only this database,
@@ -190,7 +207,6 @@ impl Registry {
 }
 
 /// A database that one connection holds open. See [FR4].
-#[derive(Debug)]
 pub struct Connected {
     pub db: Arc<Database>,
     registry: Arc<Registry>,
@@ -264,6 +280,48 @@ mod tests {
     use crate::catalog::testing::Dir;
 
     #[test]
+    fn one_table_has_one_file_and_two_have_two() {
+        let dir = Dir::new("table-files");
+        let registry = dir.registry();
+        registry.create("shop").unwrap();
+        let first = TableDef {
+            id: 1,
+            name: "item".to_string(),
+            columns: Vec::new(),
+            pk_index: 0,
+        };
+        let second = TableDef {
+            id: 2,
+            ..first.clone()
+        };
+
+        let file = registry.table_file("shop", &first).unwrap();
+        assert_eq!(registry.table_file("shop", &first).unwrap(), file);
+        assert_ne!(registry.table_file("shop", &second).unwrap(), file);
+        assert!(dir.0.join("shop").join("1.tbl").is_file());
+        assert!(dir.0.join("shop").join("2.tbl").is_file());
+    }
+
+    #[test]
+    fn a_table_of_another_database_is_another_file() {
+        let dir = Dir::new("table-files-two");
+        let registry = dir.registry();
+        registry.create("shop").unwrap();
+        registry.create("other").unwrap();
+        let table = TableDef {
+            id: 1,
+            name: "item".to_string(),
+            columns: Vec::new(),
+            pk_index: 0,
+        };
+        assert_ne!(
+            registry.table_file("shop", &table).unwrap(),
+            registry.table_file("other", &table).unwrap()
+        );
+        assert!(dir.0.join("other").join("1.tbl").is_file());
+    }
+
+    #[test]
     fn a_database_is_made_and_then_opens() {
         let dir = Dir::new("make");
         let registry = dir.registry();
@@ -299,7 +357,7 @@ mod tests {
         let dir = Dir::new("absent");
         let registry = dir.registry();
         assert_eq!(
-            Registry::connect(&registry, "shop").unwrap_err().code,
+            Registry::connect(&registry, "shop").err().unwrap().code,
             ErrorCode::UnknownDatabase
         );
         assert_eq!(
@@ -361,7 +419,7 @@ mod tests {
                 "create {name:?}"
             );
             assert_eq!(
-                Registry::connect(&registry, name).unwrap_err().code,
+                Registry::connect(&registry, name).err().unwrap().code,
                 ErrorCode::SyntaxError,
                 "connect {name:?}"
             );
@@ -432,7 +490,7 @@ mod tests {
         assert!(Registry::connect(&registry, "shop").is_ok());
         for name in ["Shop", "SHOP"] {
             assert_eq!(
-                Registry::connect(&registry, name).unwrap_err().code,
+                Registry::connect(&registry, name).err().unwrap().code,
                 ErrorCode::UnknownDatabase,
                 "connect {name}"
             );
@@ -457,7 +515,8 @@ mod tests {
         registry.bootstrap().unwrap();
         assert_eq!(
             Registry::connect(&registry, FIRST_DATABASE)
-                .unwrap_err()
+                .err()
+                .unwrap()
                 .code,
             ErrorCode::UnknownDatabase,
             "a dropped database stays dropped"
@@ -476,7 +535,7 @@ mod tests {
             ErrorCode::StorageFull
         );
         for e in [
-            Registry::connect(&registry, "shop").unwrap_err(),
+            Registry::connect(&registry, "shop").err().unwrap(),
             registry.drop_database("shop").unwrap_err(),
         ] {
             assert_eq!(e.code, ErrorCode::StorageFull, "{e}");
@@ -525,7 +584,7 @@ mod tests {
         let registry = dir.registry();
         registry.create("shop").unwrap();
         fs::write(dir.0.join("shop").join("catalog.json"), b"not json").unwrap();
-        let e = Registry::connect(&registry, "shop").unwrap_err();
+        let e = Registry::connect(&registry, "shop").err().unwrap();
         assert_eq!(e.code, ErrorCode::UnknownDatabase);
         assert!(e.message.contains("did not open"), "{e}");
         assert!(registry.sweep().is_err());

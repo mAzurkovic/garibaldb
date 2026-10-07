@@ -27,6 +27,11 @@ use crate::store::storage_error;
 pub const MAX_RECORD: usize = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE;
 
 /// An ordered map from primary key to row, in one table file.
+///
+/// Cheap to clone: a borrow of the pool, a file, and the columns of its table.
+/// A cursor takes a clone, so an operator can hold one without borrowing the
+/// tree it came from.
+#[derive(Clone)]
 pub struct BTree<'a> {
     pool: &'a BufferPool,
     file: FileId,
@@ -131,11 +136,11 @@ impl<'a> BTree<'a> {
     }
 
     /// Every row from one bound to the other, in key order.
-    pub fn cursor(&self, from: Bound<Value>, to: Bound<Value>) -> Result<Cursor<'_>, DbError> {
+    pub fn cursor(&self, from: Bound<Value>, to: Bound<Value>) -> Result<Cursor<'a>, DbError> {
         let root = self.root()?;
         if root == 0 {
             return Ok(Cursor {
-                tree: self,
+                tree: self.clone(),
                 page_no: 0,
                 slot: 0,
                 upper: to,
@@ -154,7 +159,7 @@ impl<'a> BTree<'a> {
             }
         };
         Ok(Cursor {
-            tree: self,
+            tree: self.clone(),
             page_no,
             slot,
             upper: to,
@@ -484,7 +489,7 @@ impl<'a> BTree<'a> {
 
 /// Walks the leaves in key order, from one bound to the other.
 pub struct Cursor<'a> {
-    tree: &'a BTree<'a>,
+    tree: BTree<'a>,
     page_no: u32,
     slot: u16,
     upper: Bound<Value>,

@@ -277,3 +277,90 @@ fn a_database_cannot_be_dropped_while_a_client_holds_it() {
     wait_log(&mut server.log, "closed");
     assert_eq!(kind_of(&owner.run("DROP DATABASE shop")), "DROP DATABASE");
 }
+
+/// [FR43] and [FR75]. A read answers with the columns, then the rows, then
+/// how many there were.
+#[test]
+fn a_read_answers_the_columns_then_the_rows_then_the_count() {
+    let server = Server::start();
+    let mut conn = server.connect();
+    conn.start_up();
+    conn.run("CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL)");
+    conn.run("INSERT INTO item (id, label) VALUES (1, 'apple'), (2, 'pear'), (3, 'plum')");
+
+    let answer = conn.run("SELECT label, id FROM item");
+    let ServerMsg::RowDesc { cols } = &answer[0] else {
+        panic!("expected the columns first, got {:?}", answer[0]);
+    };
+    assert_eq!(
+        cols.iter()
+            .map(|col| col.name.as_str())
+            .collect::<Vec<&str>>(),
+        vec!["label", "id"]
+    );
+
+    let rows: Vec<&Vec<protocol::Value>> = answer
+        .iter()
+        .filter_map(|msg| match msg {
+            ServerMsg::DataRow { values } => Some(values),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows[0],
+        &vec![
+            protocol::Value::Text("apple".to_string()),
+            protocol::Value::Integer(1)
+        ]
+    );
+    assert_eq!(kind_of(&answer), "SELECT");
+    let ServerMsg::Complete { rows, .. } = &answer[answer.len() - 2] else {
+        panic!("expected a complete before the ready");
+    };
+    assert_eq!(*rows, 3);
+}
+
+/// [FR56] in the small. Rows outlive the process that wrote them.
+#[test]
+fn rows_survive_a_restart() {
+    let data = DataDir::new("rows-restart");
+
+    let first = Server::start_on(&data.0, &[]);
+    let mut conn = first.connect();
+    conn.start_up();
+    conn.run("CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL)");
+    conn.run("INSERT INTO item (id, label) VALUES (1, 'apple'), (2, 'pear')");
+    drop(conn);
+    drop(first);
+
+    let second = Server::start_on(&data.0, &[]);
+    let mut conn = second.connect();
+    conn.start_up();
+    let answer = conn.run("SELECT id FROM item");
+    let rows: Vec<&Vec<protocol::Value>> = answer
+        .iter()
+        .filter_map(|msg| match msg {
+            ServerMsg::DataRow { values } => Some(values),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 2, "the rows were lost across the restart");
+    assert_eq!(rows[0], &vec![protocol::Value::Integer(1)]);
+}
+
+/// A statement that fails partway answers its error after the rows that
+/// already went, and the connection carries the next statement.
+#[test]
+fn a_read_of_a_column_that_is_not_there_answers_an_error() {
+    let server = Server::start();
+    let mut conn = server.connect();
+    conn.start_up();
+    conn.run("CREATE TABLE item (id INTEGER PRIMARY KEY)");
+    assert_eq!(
+        code_of(&conn.run("SELECT nothing FROM item")[0]),
+        ErrorCode::UnknownColumn
+    );
+    // The session is still good.
+    assert_eq!(kind_of(&conn.run("SELECT id FROM item")), "SELECT");
+}

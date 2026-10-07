@@ -2,6 +2,7 @@
 
 mod catalog;
 mod config;
+mod exec;
 mod logging;
 mod net;
 mod sql;

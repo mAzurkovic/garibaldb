@@ -23,7 +23,9 @@ impl Dir {
     }
 
     pub fn registry(&self) -> Arc<Registry> {
-        Arc::new(Registry::new(&self.0).expect("the data directory opens"))
+        // A pool of a few hundred frames, which is plenty for a test and
+        // keeps every one of them cheap to build.
+        Arc::new(Registry::new(&self.0, 4 * 1024 * 1024).expect("the data directory opens"))
     }
 
     /// A registry holding one database named `shop`, and that database open.

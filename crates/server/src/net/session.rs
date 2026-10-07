@@ -9,10 +9,10 @@ use std::net::TcpStream;
 use std::sync::Arc;
 
 use protocol::error::ErrorCode;
-use protocol::message::{ClientMsg, PROTOCOL_VERSION, ServerMsg, TxState};
+use protocol::message::{ClientMsg, ColumnDesc, PROTOCOL_VERSION, ServerMsg, TxState};
 
-use crate::catalog::ddl;
 use crate::catalog::registry::{Connected, Registry};
+use crate::exec::dml::{self, Answer};
 use crate::net::cancel::{CancelHandle, CancelRegistry, new_secret};
 use crate::sql::parser;
 
@@ -63,31 +63,58 @@ impl Session {
         for line in lines {
             // A read error ends the session, like EOF.
             let Ok(line) = line else { break };
-            let answer = match read_line(&line) {
+            let written = match read_line(&line) {
                 Asked::Leave => break,
-                Asked::Reply(msg) => msg,
-                Asked::Statement(sql) => self.run_statement(&sql, registry),
+                Asked::Reply(msg) => self.reply(stream, &msg),
+                Asked::Statement(sql) => self.run_statement(stream, &sql, registry),
             };
-            if self.reply(stream, &answer).is_err() || self.reply(stream, &self.ready()).is_err() {
+            if written.is_err() || self.reply(stream, &self.ready()).is_err() {
                 break;
             }
         }
     }
 
-    /// Reads one statement and runs it. A schema change runs now. A statement
-    /// on a row waits for the executor in milestone 8.
-    fn run_statement(&self, sql: &str, registry: &Registry) -> ServerMsg {
-        let statement = match parser::parse(sql) {
-            Ok(statement) => statement,
-            Err(e) => return ServerMsg::from(e),
+    /// Reads one statement, runs it, and writes its answer.
+    ///
+    /// Rows go out as they arrive, so a result larger than the memory of the
+    /// server still reaches the client. The error of a row that fails partway
+    /// follows the rows that already went.
+    fn run_statement(&self, stream: &TcpStream, sql: &str, registry: &Registry) -> io::Result<()> {
+        let answer =
+            parser::parse(sql).and_then(|statement| dml::run(&statement, &self.held.db, registry));
+        let mut plan = match answer {
+            Err(e) => return self.reply(stream, &ServerMsg::from(e)),
+            Ok(Answer::Changed { kind, rows }) => {
+                return self.reply(
+                    stream,
+                    &ServerMsg::Complete {
+                        kind: kind.to_string(),
+                        rows,
+                    },
+                );
+            }
+            Ok(Answer::Rows(plan)) => plan,
         };
-        match ddl::run(&statement, &self.held.db, registry) {
-            Ok(kind) => ServerMsg::Complete {
-                kind: kind.to_string(),
-                rows: 0,
-            },
-            Err(e) => ServerMsg::from(e),
+        let cols = plan.schema().iter().map(describe).collect();
+        self.reply(stream, &ServerMsg::RowDesc { cols })?;
+        let mut rows = 0;
+        loop {
+            match plan.next() {
+                Err(e) => return self.reply(stream, &ServerMsg::from(e)),
+                Ok(None) => break,
+                Ok(Some(values)) => {
+                    rows += 1;
+                    self.reply(stream, &ServerMsg::DataRow { values })?;
+                }
+            }
         }
+        self.reply(
+            stream,
+            &ServerMsg::Complete {
+                kind: "SELECT".to_string(),
+                rows,
+            },
+        )
     }
 
     /// Frees the connection. The listener logs the close, because the line
@@ -224,6 +251,14 @@ fn read_line(line: &str) -> Asked {
             ErrorCode::SyntaxError,
             format!("malformed message: {e}"),
         )),
+    }
+}
+
+/// One column of a result, as the wire names it.
+fn describe(column: &crate::catalog::ColumnDef) -> ColumnDesc {
+    ColumnDesc {
+        name: column.name.clone(),
+        ty: column.ty,
     }
 }
 
@@ -445,52 +480,5 @@ mod tests {
         let secret = session.secret;
         session.on_disconnect(&cancels);
         assert!(!cancels.cancel(5, secret));
-    }
-
-    #[test]
-    fn a_schema_change_answers_complete_and_names_its_kind() {
-        let dir = Dir::new("session-ddl");
-        let (registry, held) = dir.shop();
-        let cancels = CancelRegistry::new();
-        let session = Session::start(1, held, &cancels);
-        assert_eq!(
-            session.run_statement("CREATE TABLE item (id INTEGER PRIMARY KEY)", &registry),
-            ServerMsg::Complete {
-                kind: "CREATE TABLE".to_string(),
-                rows: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn a_statement_that_does_not_parse_answers_its_position() {
-        let dir = Dir::new("session-syntax");
-        let (registry, held) = dir.shop();
-        let cancels = CancelRegistry::new();
-        let session = Session::start(1, held, &cancels);
-        let ServerMsg::Error {
-            code,
-            message,
-            position,
-        } = session.run_statement("SELECT a FROM", &registry)
-        else {
-            panic!("expected an error");
-        };
-        assert_eq!(code, ErrorCode::SyntaxError);
-        assert_eq!(position, Some(14));
-        assert!(message.contains("a name"), "{message}");
-    }
-
-    #[test]
-    fn a_statement_on_a_row_still_answers_unknown_table() {
-        let dir = Dir::new("session-rows");
-        let (registry, held) = dir.shop();
-        let cancels = CancelRegistry::new();
-        let session = Session::start(1, held, &cancels);
-        session.run_statement("CREATE TABLE item (id INTEGER PRIMARY KEY)", &registry);
-        assert_eq!(
-            code_of(&session.run_statement("SELECT * FROM item", &registry)),
-            ErrorCode::UnknownTable
-        );
     }
 }

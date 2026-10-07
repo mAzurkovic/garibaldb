@@ -9,7 +9,13 @@ statement error UNKNOWN_TABLE
 SELECT * FROM item
 
 statement error UNKNOWN_TABLE
-SELECT id, label FROM item WHERE id >= 2 AND label IS NOT NULL ORDER BY label DESC LIMIT 10
+SELECT id, label FROM item WHERE id >= 2 AND label IS NOT NULL LIMIT 10
+
+# Sorting waits for the external sort, so a statement that asks for it is
+# refused rather than answered in the wrong order.
+
+statement error SYNTAX_ERROR
+SELECT id FROM item ORDER BY label DESC
 
 statement error UNKNOWN_TABLE
 UPDATE item SET label = 'c', sold = true WHERE id = 1
@@ -17,16 +23,19 @@ UPDATE item SET label = 'c', sold = true WHERE id = 1
 statement error UNKNOWN_TABLE
 DELETE FROM item WHERE id != 1
 
-statement error UNKNOWN_TABLE
+# A transaction holds no meaning until there is a log to roll back to, and
+# refusing BEGIN keeps a client from believing it holds one.
+
+statement error TXN_ABORTED
 BEGIN
 
-statement error UNKNOWN_TABLE
+statement error TXN_ABORTED
 BEGIN READ ONLY
 
-statement error UNKNOWN_TABLE
+statement error TXN_ABORTED
 COMMIT
 
-statement error UNKNOWN_TABLE
+statement error TXN_ABORTED
 ROLLBACK
 
 # A statement reads across lines, because the client sends what the user typed.

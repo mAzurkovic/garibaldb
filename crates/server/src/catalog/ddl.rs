@@ -9,45 +9,11 @@ use std::io;
 
 use protocol::{DbError, ErrorCode};
 
-use crate::catalog::registry::Registry;
 use crate::catalog::{ColumnDef, Database, named};
-use crate::sql::ast::{ColumnSpec, Statement};
-
-/// Runs one statement and names its kind for the `Complete` that follows.
-///
-/// A statement that reads or writes a row answers `UNKNOWN_TABLE`, because
-/// the executor arrives in milestone 8 and a transaction in milestone 10.
-pub fn run(
-    statement: &Statement,
-    db: &Database,
-    registry: &Registry,
-) -> Result<&'static str, DbError> {
-    match statement {
-        Statement::CreateDatabase { name } => {
-            registry.create(name)?;
-            Ok("CREATE DATABASE")
-        }
-        Statement::DropDatabase { name } => {
-            registry.drop_database(name)?;
-            Ok("DROP DATABASE")
-        }
-        Statement::CreateTable { name, columns } => {
-            create_table(db, name, columns)?;
-            Ok("CREATE TABLE")
-        }
-        Statement::DropTable { name } => {
-            drop_table(db, name)?;
-            Ok("DROP TABLE")
-        }
-        _ => Err(named(
-            ErrorCode::UnknownTable,
-            "the server runs no statement on a table yet",
-        )),
-    }
-}
+use crate::sql::ast::ColumnSpec;
 
 /// Adds a table. See [FR6] to [FR9] and [FR12].
-fn create_table(db: &Database, name: &str, specs: &[ColumnSpec]) -> Result<(), DbError> {
+pub fn create_table(db: &Database, name: &str, specs: &[ColumnSpec]) -> Result<(), DbError> {
     check_columns(name, specs)?;
     let pk_index = primary_key(name, specs)?;
     let columns = specs
@@ -71,7 +37,7 @@ fn create_table(db: &Database, name: &str, specs: &[ColumnSpec]) -> Result<(), D
 
 /// Deletes a table and the rows that went with it. See [FR10], [FR11],
 /// and [FR13].
-fn drop_table(db: &Database, name: &str) -> Result<(), DbError> {
+pub fn drop_table(db: &Database, name: &str) -> Result<(), DbError> {
     let mut catalog = db.catalog.lock().expect("the catalog lock holds");
     let table = catalog.remove_table(name)?;
     let rows = catalog.dir().join(table.file_name());
@@ -131,14 +97,27 @@ mod tests {
     use protocol::DataType;
 
     use super::*;
+    use crate::catalog::registry::Registry;
+    use crate::sql::ast::Statement;
     use crate::sql::parser;
 
     use crate::catalog::testing::Dir;
 
-    /// Runs the statement that `sql` holds.
+    /// Runs the schema change that `sql` holds.
     fn run_sql(sql: &str, db: &Database, registry: &Registry) -> Result<&'static str, DbError> {
-        let statement = parser::parse(sql).expect("the statement parses");
-        run(&statement, db, registry)
+        match parser::parse(sql).expect("the statement parses") {
+            Statement::CreateDatabase { name } => {
+                registry.create(&name).map(|()| "CREATE DATABASE")
+            }
+            Statement::DropDatabase { name } => {
+                registry.drop_database(&name).map(|()| "DROP DATABASE")
+            }
+            Statement::CreateTable { name, columns } => {
+                create_table(db, &name, &columns).map(|()| "CREATE TABLE")
+            }
+            Statement::DropTable { name } => drop_table(db, &name).map(|()| "DROP TABLE"),
+            other => panic!("not a schema change: {other:?}"),
+        }
     }
 
     #[test]
@@ -294,33 +273,6 @@ mod tests {
         fs::write(&rows, b"rows").unwrap();
         run_sql("DROP TABLE item", &held.db, &registry).unwrap();
         assert!(!rows.exists());
-    }
-
-    #[test]
-    fn a_statement_on_a_row_waits_for_the_executor() {
-        let dir = Dir::new("rows-later");
-        let (registry, held) = dir.shop();
-        run_sql(
-            "CREATE TABLE item (id INTEGER PRIMARY KEY)",
-            &held.db,
-            &registry,
-        )
-        .unwrap();
-        for sql in [
-            "SELECT * FROM item",
-            "INSERT INTO item (id) VALUES (1)",
-            "UPDATE item SET id = 2",
-            "DELETE FROM item",
-            "BEGIN",
-            "COMMIT",
-            "ROLLBACK",
-        ] {
-            assert_eq!(
-                run_sql(sql, &held.db, &registry).unwrap_err().code,
-                ErrorCode::UnknownTable,
-                "{sql}"
-            );
-        }
     }
 
     #[test]

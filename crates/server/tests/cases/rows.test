@@ -1,0 +1,174 @@
+# Rows go in, come back, change, and go. Every statement runs on its own,
+# because a transaction is not here yet.
+
+statement ok
+CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL, sold BOOLEAN, price DECIMAL(10, 2))
+
+statement ok
+INSERT INTO item (id, label, sold, price) VALUES (1, 'apple', false, 1.50)
+
+# More than one row in one statement.
+
+statement ok
+INSERT INTO item (id, label, sold, price) VALUES (2, 'pear', true, 2.25), (3, 'plum', false, 0.75)
+
+query
+SELECT id, label FROM item
+----
+1 | apple
+2 | pear
+3 | plum
+(3 rows)
+
+# A column the statement leaves out holds nothing.
+
+statement ok
+INSERT INTO item (id, label) VALUES (4, 'fig')
+
+query
+SELECT id, sold, price FROM item WHERE id = 4
+----
+4 | NULL | NULL
+(1 row)
+
+# A key the table already holds is refused, and the table is left as it was.
+
+statement error DUPLICATE_KEY
+INSERT INTO item (id, label) VALUES (1, 'again')
+
+# So is a key that repeats inside one statement, before anything is written.
+
+statement error DUPLICATE_KEY
+INSERT INTO item (id, label) VALUES (9, 'nine'), (9, 'nine again')
+
+query
+SELECT id FROM item WHERE id = 9
+----
+(0 rows)
+
+# A column that holds a value for every row cannot be left empty.
+
+statement error NOT_NULL_VIOLATION
+INSERT INTO item (id) VALUES (5)
+
+statement error NOT_NULL_VIOLATION
+INSERT INTO item (id, label) VALUES (5, NULL)
+
+# Nor can a value of the wrong type go in.
+
+statement error TYPE_MISMATCH
+INSERT INTO item (id, label) VALUES ('five', 'five')
+
+statement error TYPE_MISMATCH
+INSERT INTO item (id, label) VALUES (5, 5)
+
+# A decimal that needs more digits than its column holds is the same failure.
+
+statement error TYPE_MISMATCH
+INSERT INTO item (id, label, price) VALUES (5, 'five', 1.555)
+
+statement error UNKNOWN_COLUMN
+INSERT INTO item (id, nothing) VALUES (5, 'five')
+
+statement error UNKNOWN_TABLE
+INSERT INTO other (id) VALUES (1)
+
+query
+SELECT id FROM item WHERE id = 5
+----
+(0 rows)
+
+# A change reaches every row that matches, and no other.
+
+statement ok
+UPDATE item SET sold = true WHERE price IS NULL
+
+query
+SELECT id, sold FROM item
+----
+1 | false
+2 | true
+3 | false
+4 | true
+(4 rows)
+
+statement ok
+UPDATE item SET label = 'quince', price = 9.99 WHERE id = 3
+
+query
+SELECT label, price FROM item WHERE id = 3
+----
+quince | 9.99
+(1 row)
+
+# A change with no condition reaches all of them.
+
+statement ok
+UPDATE item SET sold = false
+
+query
+SELECT id FROM item WHERE sold = true
+----
+(0 rows)
+
+statement error NOT_NULL_VIOLATION
+UPDATE item SET label = NULL
+
+statement error TYPE_MISMATCH
+UPDATE item SET id = 'one'
+
+statement error UNKNOWN_COLUMN
+UPDATE item SET nothing = 1
+
+# A primary key may move, onto a key nothing holds.
+
+statement ok
+UPDATE item SET id = 40 WHERE id = 4
+
+query
+SELECT id FROM item WHERE id = 40
+----
+40
+(1 row)
+
+statement error DUPLICATE_KEY
+UPDATE item SET id = 1 WHERE id = 2
+
+# A delete reaches every row that matches.
+
+statement ok
+DELETE FROM item WHERE id = 40
+
+query
+SELECT id FROM item
+----
+1
+2
+3
+(3 rows)
+
+statement ok
+DELETE FROM item
+
+query
+SELECT id FROM item
+----
+(0 rows)
+
+# A row holding a value too large for a record keeps it in a chain, and the
+# chain goes when the row does.
+
+statement ok
+INSERT INTO item (id, label) VALUES (1, 'x')
+
+statement ok
+DELETE FROM item WHERE id = 1
+
+statement error UNKNOWN_TABLE
+SELECT id FROM other
+
+statement ok
+DROP TABLE item
+
+statement error UNKNOWN_TABLE
+SELECT id FROM item

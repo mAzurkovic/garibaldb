@@ -13,6 +13,7 @@ pub mod codec;
 pub mod overflow;
 pub mod page;
 pub mod pool;
+pub mod row;
 
 use protocol::{DbError, ErrorCode};
 

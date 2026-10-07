@@ -1,0 +1,202 @@
+# Reading rows: the columns asked for, every condition the grammar holds, and
+# the count of rows.
+
+statement ok
+CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL, sold BOOLEAN, price DECIMAL(10, 2))
+
+statement ok
+INSERT INTO item (id, label, sold, price) VALUES (1, 'apple', false, 1.50), (2, 'pear', true, 2.25), (3, 'plum', false, 0.75), (4, 'fig', true, 3.00)
+
+statement ok
+INSERT INTO item (id, label) VALUES (5, 'sloe')
+
+# The columns asked for, in the order asked for.
+
+query
+SELECT label, id FROM item WHERE id = 1
+----
+apple | 1
+(1 row)
+
+query
+SELECT * FROM item WHERE id = 1
+----
+1 | apple | false | 1.50
+(1 row)
+
+statement error UNKNOWN_COLUMN
+SELECT nothing FROM item
+
+# Every comparison, on the key and on another column.
+
+query
+SELECT id FROM item WHERE id = 3
+----
+3
+(1 row)
+
+query
+SELECT id FROM item WHERE id != 3
+----
+1
+2
+4
+5
+(4 rows)
+
+query
+SELECT id FROM item WHERE id < 3
+----
+1
+2
+(2 rows)
+
+query
+SELECT id FROM item WHERE id <= 2
+----
+1
+2
+(2 rows)
+
+query
+SELECT id FROM item WHERE id > 4
+----
+5
+(1 row)
+
+query
+SELECT id FROM item WHERE id >= 4
+----
+4
+5
+(2 rows)
+
+query
+SELECT id FROM item WHERE label = 'plum'
+----
+3
+(1 row)
+
+# A decimal compares by value, so the digits it was written with do not matter.
+
+query
+SELECT id FROM item WHERE price = 3.0
+----
+4
+(1 row)
+
+# AND, OR, NOT, and parentheses.
+
+query
+SELECT id FROM item WHERE id > 1 AND sold = false
+----
+3
+(1 row)
+
+query
+SELECT id FROM item WHERE id = 1 OR id = 4
+----
+1
+4
+(2 rows)
+
+query
+SELECT id FROM item WHERE NOT sold = true
+----
+1
+3
+(2 rows)
+
+query
+SELECT id FROM item WHERE (id = 1 OR id = 2) AND sold = true
+----
+2
+(1 row)
+
+# A comparison with nothing is neither true nor false, so the row stays out of
+# the result, whichever way it is asked.
+
+query
+SELECT id FROM item WHERE price = 1.50
+----
+1
+(1 row)
+
+query
+SELECT id FROM item WHERE price != 1.50
+----
+2
+3
+4
+(3 rows)
+
+query
+SELECT id FROM item WHERE sold = true
+----
+2
+4
+(2 rows)
+
+# Asking whether a value is there at all is a different question.
+
+query
+SELECT id FROM item WHERE price IS NULL
+----
+5
+(1 row)
+
+query
+SELECT id FROM item WHERE price IS NOT NULL
+----
+1
+2
+3
+4
+(4 rows)
+
+# A column that holds a true or a false stands as a condition on its own.
+
+query
+SELECT id FROM item WHERE sold
+----
+2
+4
+(2 rows)
+
+# The count of rows a result holds.
+
+query
+SELECT id FROM item LIMIT 2
+----
+1
+2
+(2 rows)
+
+query
+SELECT id FROM item LIMIT 0
+----
+(0 rows)
+
+query
+SELECT id FROM item WHERE id > 1 LIMIT 2
+----
+2
+3
+(2 rows)
+
+# A limit past the end of the rows is every row.
+
+query
+SELECT id FROM item LIMIT 99
+----
+1
+2
+3
+4
+5
+(5 rows)
+
+query
+SELECT id FROM item WHERE id = 99
+----
+(0 rows)

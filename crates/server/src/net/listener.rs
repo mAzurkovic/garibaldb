@@ -35,7 +35,7 @@ impl Server {
     /// Binds the port of the config. Port 0 takes any free port, which
     /// [`Server::local_addr`] then reports.
     pub fn bind(config: &Config) -> io::Result<Server> {
-        let databases = Registry::new(&config.data_dir)?;
+        let databases = Registry::new(&config.data_dir, config.mem_limit)?;
         databases.bootstrap()?;
         // A crash can leave a table file that no catalog names. It is dead
         // weight, and milestone 6 would read it as a table.
