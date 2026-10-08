@@ -37,9 +37,10 @@ No `JOIN`, no indexes, no aggregates, no replication, no authentication.
 
 ## Status
 
-Milestone 8 of 12 done. It is a database: `INSERT` and `SELECT` work, and rows survive a restart.
-No transaction and no write-ahead log yet, so a power cut can still lose a write. `ORDER BY`
-arrives in milestone 11.
+Milestone 9 of 12 done. It is a durable database: `INSERT` and `SELECT` work, a committed row
+outlives a `kill -9`, and a write that never committed leaves no trace. No transaction yet, so
+`BEGIN` is still refused, and a power cut against a real disk stays unproven. `ORDER BY` arrives
+in milestone 11.
 See [docs/projectplan.md](docs/projectplan.md).
 
 ## Build
