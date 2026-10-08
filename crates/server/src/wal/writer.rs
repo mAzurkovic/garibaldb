@@ -185,8 +185,10 @@ impl Wal {
             .open(&path)
             .map_err(|e| storage_error(format!("{} did not open: {e}", path.display())))?;
         let recovered = recovery::recover(&file)?;
-        file.set_len(recovered.end)
-            .map_err(|e| storage_error(format!("the log did not shorten: {e}")))?;
+        if recovered.end < recovered.len {
+            file.set_len(recovered.end)
+                .map_err(|e| storage_error(format!("the log did not shorten: {e}")))?;
+        }
         Ok(Wal {
             file,
             limit,

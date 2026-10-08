@@ -16,6 +16,8 @@ pub struct Recovered {
     pub index: FrameIndex,
     /// Where the log ends once the uncommitted tail is cut away.
     pub end: u64,
+    /// How long the file was before that, so a log with no tail is left alone.
+    pub len: u64,
     pub next_lsn: u64,
 }
 
@@ -31,6 +33,7 @@ pub fn recover(file: &File) -> Result<Recovered, DbError> {
     let mut committed = Recovered {
         index: FrameIndex::default(),
         end: 0,
+        len,
         next_lsn: 0,
     };
     let mut at = 0;
