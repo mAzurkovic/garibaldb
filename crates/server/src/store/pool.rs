@@ -18,6 +18,7 @@ use protocol::DbError;
 
 use crate::store::page::{FileHeader, FileId, PAGE_SIZE, Page, PageHeader, PageId, PageKind};
 use crate::store::storage_error;
+use crate::wal::writer::Wal;
 
 /// The share of the memory limit that the budget gives the pool, as 640 MB
 /// of every gigabyte.
@@ -38,19 +39,39 @@ struct Meta {
     used: bool,
 }
 
+/// One table file, with the table it holds and the log its writes go to.
+#[derive(Clone)]
+struct Open {
+    file: Arc<File>,
+    /// The table id, which is also the name of the file. A frame names a
+    /// table this way, because a `FileId` means nothing to the next process.
+    table: u32,
+    wal: Arc<Wal>,
+}
+
 /// The files the pool has open.
 #[derive(Default)]
 struct Files {
-    open: Vec<Arc<File>>,
+    open: Vec<Open>,
     ids: HashMap<PathBuf, FileId>,
 }
 
 impl Files {
-    fn file(&self, id: FileId) -> Result<Arc<File>, DbError> {
+    fn at(&self, id: FileId) -> Result<Open, DbError> {
         self.open
             .get(id.0 as usize)
             .cloned()
             .ok_or_else(|| storage_error(format!("the pool holds no file {}", id.0)))
+    }
+
+    /// The file of one table of one database. A table id repeats across
+    /// databases, so the log is what tells them apart.
+    fn of_table(&self, wal: &Arc<Wal>, table: u32) -> Result<Open, DbError> {
+        self.open
+            .iter()
+            .find(|open| open.table == table && Arc::ptr_eq(&open.wal, wal))
+            .cloned()
+            .ok_or_else(|| storage_error(format!("the pool holds no table {table}")))
     }
 }
 
@@ -103,9 +124,12 @@ impl BufferPool {
         inner.meta.iter().filter(|meta| meta.page.is_some()).count()
     }
 
-    /// Opens a table file, or returns the id it already has. A file with no
-    /// bytes gets its header page, so page 0 always reads as one.
-    pub fn open(&self, path: &Path) -> Result<FileId, DbError> {
+    /// Opens a table file, or returns the id it already has.
+    ///
+    /// A file with no bytes gets its header page, written straight to the
+    /// file rather than the log. A crash after that leaves an empty header,
+    /// which is what a new table starts with anyway.
+    pub fn open(&self, path: &Path, table: u32, wal: Arc<Wal>) -> Result<FileId, DbError> {
         let mut inner = self.inner.lock().expect("the pool lock holds");
         if let Some(&id) = inner.files.ids.get(path) {
             return Ok(id);
@@ -131,7 +155,11 @@ impl BufferPool {
             write_page(&file, 0, &page)?;
         }
         let id = FileId(inner.files.open.len() as u32);
-        inner.files.open.push(Arc::new(file));
+        inner.files.open.push(Open {
+            file: Arc::new(file),
+            table,
+            wal,
+        });
         inner.files.ids.insert(path.to_path_buf(), id);
         Ok(id)
     }
@@ -193,23 +221,57 @@ impl BufferPool {
         Ok(())
     }
 
-    /// Writes every page that was changed. No page may be held, because a
-    /// held page is one the caller may still be writing to.
-    pub fn flush_all(&self) -> Result<(), DbError> {
-        let mut inner = self.inner.lock().expect("the pool lock holds");
-        for frame in 0..self.frames.len() {
-            let meta = inner.meta[frame];
-            let Some(page) = meta.page.filter(|_| meta.dirty) else {
-                continue;
-            };
-            let file = inner.files.file(page.file)?;
-            let Ok(bytes) = self.frames[frame].try_lock() else {
-                return Err(storage_error("a page is held while the pool flushes"));
-            };
-            write_page(&file, page.page_no, &bytes)?;
-            inner.meta[frame].dirty = false;
+    /// Appends every changed page of one log's files, then commits the log.
+    ///
+    /// No page may be held, because a held page is one the caller may still
+    /// be writing to.
+    pub fn commit(&self, wal: &Arc<Wal>) -> Result<(), DbError> {
+        {
+            let mut inner = self.inner.lock().expect("the pool lock holds");
+            for frame in 0..self.frames.len() {
+                let meta = inner.meta[frame];
+                let Some(page) = meta.page.filter(|_| meta.dirty) else {
+                    continue;
+                };
+                let open = inner.files.at(page.file)?;
+                if !Arc::ptr_eq(&open.wal, wal) {
+                    continue;
+                }
+                let Ok(bytes) = self.frames[frame].try_lock() else {
+                    return Err(storage_error("a page is held while the log is committed"));
+                };
+                open.wal.append_page(open.table, page.page_no, &bytes)?;
+                inner.meta[frame].dirty = false;
+            }
         }
-        Ok(())
+        wal.commit()
+    }
+
+    /// Puts one page in its table file, where the log is not. Only a
+    /// checkpoint does this, and it syncs the file afterwards.
+    pub fn write_to_table(
+        &self,
+        wal: &Arc<Wal>,
+        table: u32,
+        page_no: u32,
+        page: &Page,
+    ) -> Result<(), DbError> {
+        let open = {
+            let inner = self.inner.lock().expect("the pool lock holds");
+            inner.files.of_table(wal, table)?
+        };
+        write_page(&open.file, page_no, page)
+    }
+
+    /// Settles a table file, once a checkpoint has put every page in it.
+    pub fn sync_table(&self, wal: &Arc<Wal>, table: u32) -> Result<(), DbError> {
+        let open = {
+            let inner = self.inner.lock().expect("the pool lock holds");
+            inner.files.of_table(wal, table)?
+        };
+        open.file
+            .sync_all()
+            .map_err(|e| storage_error(format!("a table file did not sync: {e}")))
     }
 
     /// Finds the frame of a page, reading it in when the pool holds it not.
@@ -226,10 +288,15 @@ impl BufferPool {
             return Ok(frame);
         }
         let frame = self.claim(&mut inner)?;
-        let file = inner.files.file(id.file)?;
+        let open = inner.files.at(id.file)?;
         {
             let mut bytes = self.frames[frame].lock().expect("the frame lock holds");
-            read_page(&file, id.page_no, &mut bytes)?;
+            // The log holds the newest form of a page until a checkpoint
+            // moves it, so it answers before the table file does.
+            match open.wal.read_page(open.table, id.page_no, open.wal.end())? {
+                Some(page) => bytes[..].copy_from_slice(page.as_slice()),
+                None => read_page(&open.file, id.page_no, &mut bytes)?,
+            }
         }
         inner.map.insert(id, frame);
         inner.meta[frame] = Meta {
@@ -258,9 +325,11 @@ impl BufferPool {
             }
             if let Some(page) = meta.page {
                 if meta.dirty {
-                    let file = inner.files.file(page.file)?;
+                    // To the log and not the table file. The frame is not
+                    // committed, and recovery drops it unless one follows.
+                    let open = inner.files.at(page.file)?;
                     let bytes = self.frames[frame].lock().expect("the frame lock holds");
-                    write_page(&file, page.page_no, &bytes)?;
+                    open.wal.append_page(open.table, page.page_no, &bytes)?;
                 }
                 inner.map.remove(&page);
             }
@@ -273,9 +342,13 @@ impl BufferPool {
     }
 
     /// Adds a page to the end of a file and returns its number.
+    ///
+    /// The length of the file is not logged. A crash after this leaves a page
+    /// of zeros at the end, which the allocator hands out again and the
+    /// startup sweep clears.
     fn grow(&self, file: FileId) -> Result<u32, DbError> {
         let inner = self.inner.lock().expect("the pool lock holds");
-        let handle = inner.files.file(file)?;
+        let handle = inner.files.at(file)?.file;
         let len = handle
             .metadata()
             .map_err(|e| storage_error(format!("the file did not read: {e}")))?
@@ -352,15 +425,15 @@ fn offset_of(page_no: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::testing::Dir;
-    use crate::store::page::{HEADER_SIZE, SlottedPage, page_u32, write_u32};
+    use std::sync::Arc;
 
-    /// A pool of `frames` frames, and one open table file.
-    fn pool(label: &str, frames: usize) -> (Dir, BufferPool, FileId) {
-        let dir = Dir::new(label);
-        let pool = BufferPool::with_frames(frames);
-        let file = pool.open(&dir.0.join("1.tbl")).expect("the file opens");
-        (dir, pool, file)
+    use crate::catalog::testing::{self, Dir};
+    use crate::store::page::{HEADER_SIZE, SlottedPage, page_u32, write_u32};
+    use crate::wal::writer::{FRAME_HEADER, Wal};
+
+    /// A pool of `frames` frames, a log, and one open table file.
+    fn pool(label: &str, frames: usize) -> (Dir, BufferPool, Arc<Wal>, FileId) {
+        testing::table(label, frames)
     }
 
     /// Writes the page number into a page, so a read can prove which page it
@@ -379,7 +452,7 @@ mod tests {
 
     #[test]
     fn a_new_file_opens_with_a_header_page() {
-        let (_dir, pool, file) = pool("new-file", 4);
+        let (_dir, pool, _wal, file) = pool("new-file", 4);
         let page = pool.fetch(PageId::new(file, 0)).unwrap();
         assert_eq!(
             FileHeader::read(page.bytes()).unwrap(),
@@ -392,30 +465,36 @@ mod tests {
 
     #[test]
     fn the_same_path_opens_once() {
-        let (dir, pool, file) = pool("same-path", 4);
-        let again = pool.open(&dir.0.join("1.tbl")).unwrap();
+        let (dir, pool, wal, file) = pool("same-path", 4);
+        let again = pool
+            .open(&dir.0.join("1.tbl"), 1, Arc::clone(&wal))
+            .unwrap();
         assert_eq!(file, again);
-        let other = pool.open(&dir.0.join("2.tbl")).unwrap();
+        let other = pool
+            .open(&dir.0.join("2.tbl"), 2, Arc::clone(&wal))
+            .unwrap();
         assert_ne!(file, other);
     }
 
     #[test]
     fn a_path_that_will_not_open_is_an_error() {
-        let (dir, pool, _) = pool("bad-path", 4);
-        let e = pool.open(&dir.0.join("no").join("where.tbl")).unwrap_err();
+        let (dir, pool, wal, _) = pool("bad-path", 4);
+        let e = pool
+            .open(&dir.0.join("no").join("where.tbl"), 2, wal)
+            .unwrap_err();
         assert!(e.message.contains("did not open"), "{e}");
     }
 
     #[test]
     fn a_file_the_pool_never_opened_is_an_error() {
-        let (_dir, pool, _) = pool("no-file", 4);
+        let (_dir, pool, _wal, _) = pool("no-file", 4);
         let e = pool.fetch(PageId::new(FileId(99), 0)).err().unwrap();
         assert!(e.message.contains("holds no file 99"), "{e}");
     }
 
     #[test]
     fn a_page_read_after_its_frame_was_reused_holds_what_was_written() {
-        let (_dir, pool, file) = pool("round-trip", LEAST_FRAMES);
+        let (_dir, pool, _wal, file) = pool("round-trip", LEAST_FRAMES);
         let pages: Vec<PageId> = (0..8).map(|_| pool.allocate(file).unwrap()).collect();
         for id in &pages {
             stamp(&pool, *id);
@@ -428,7 +507,7 @@ mod tests {
 
     #[test]
     fn a_pinned_page_is_never_evicted() {
-        let (_dir, pool, file) = pool("pinned", LEAST_FRAMES);
+        let (_dir, pool, _wal, file) = pool("pinned", LEAST_FRAMES);
         let first = pool.allocate(file).unwrap();
         stamp(&pool, first);
 
@@ -443,7 +522,7 @@ mod tests {
 
     #[test]
     fn a_pool_whose_every_frame_is_held_refuses() {
-        let (_dir, pool, file) = pool("full", LEAST_FRAMES);
+        let (_dir, pool, _wal, file) = pool("full", LEAST_FRAMES);
         let one = pool.allocate(file).unwrap();
         let two = pool.allocate(file).unwrap();
         let _first = pool.fetch(one).unwrap();
@@ -453,48 +532,124 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_page_reaches_its_file() {
+    fn a_committed_page_comes_back_through_the_log() {
         let dir = Dir::new("durable");
         let path = dir.0.join("1.tbl");
         let id = {
             let pool = BufferPool::with_frames(4);
-            let file = pool.open(&path).unwrap();
+            let wal = Arc::new(Wal::open(&dir.0, 64 * 1024 * 1024).unwrap());
+            let file = pool.open(&path, 1, Arc::clone(&wal)).unwrap();
             let id = pool.allocate(file).unwrap();
             stamp(&pool, id);
-            pool.flush_all().unwrap();
+            pool.commit(&wal).unwrap();
             id
         };
-        // A pool of its own, so nothing is read from memory.
+        // A pool and a log of their own, so nothing comes from memory. The
+        // page is in the log and not yet in the table file.
         let pool = BufferPool::with_frames(4);
-        let file = pool.open(&path).unwrap();
+        let wal = Arc::new(Wal::open(&dir.0, 64 * 1024 * 1024).unwrap());
+        let file = pool.open(&path, 1, wal).unwrap();
         assert_eq!(stamped(&pool, PageId::new(file, id.page_no)), id.page_no);
     }
 
     #[test]
-    fn a_page_nobody_changed_is_not_written() {
-        let (_dir, pool, file) = pool("clean", 4);
+    fn a_commit_leaves_nothing_changed_behind_it() {
+        let (_dir, pool, wal, file) = pool("clean", 4);
         let id = pool.allocate(file).unwrap();
         stamp(&pool, id);
-        pool.flush_all().unwrap();
-        // Reading leaves the page clean, so a second flush writes nothing and
-        // cannot fail.
+        pool.commit(&wal).unwrap();
+        let after = wal.end();
+
+        // Reading changes nothing, so a second commit appends only its own
+        // frame and no page.
         assert_eq!(stamped(&pool, id), id.page_no);
-        pool.flush_all().unwrap();
+        pool.commit(&wal).unwrap();
+        assert_eq!(wal.end(), after + FRAME_HEADER as u64);
     }
 
     #[test]
-    fn a_flush_while_a_page_is_held_is_an_error_and_not_a_wait() {
-        let (_dir, pool, file) = pool("held-flush", 4);
+    fn a_commit_leaves_the_pages_of_another_log_alone() {
+        let dir = Dir::new("two-logs");
+        let pool = BufferPool::with_frames(8);
+        let one = Arc::new(Wal::open(&dir.0.join("one"), 64 * 1024 * 1024).unwrap());
+        let two = Arc::new(Wal::open(&dir.0.join("two"), 64 * 1024 * 1024).unwrap());
+        let first = pool
+            .open(&dir.0.join("one").join("1.tbl"), 1, Arc::clone(&one))
+            .unwrap();
+        let second = pool
+            .open(&dir.0.join("two").join("1.tbl"), 1, Arc::clone(&two))
+            .unwrap();
+        stamp(&pool, pool.allocate(first).unwrap());
+        stamp(&pool, pool.allocate(second).unwrap());
+
+        pool.commit(&one).unwrap();
+        assert!(one.end() > 0, "its own pages went to its own log");
+        assert_eq!(two.end(), 0, "the other log was left alone");
+
+        pool.commit(&two).unwrap();
+        assert!(two.end() > 0);
+    }
+
+    #[test]
+    fn a_commit_while_a_page_is_held_is_an_error_and_not_a_wait() {
+        let (_dir, pool, wal, file) = pool("held-commit", 4);
         let id = pool.allocate(file).unwrap();
         let mut page = pool.fetch(id).unwrap();
         SlottedPage::init(page.bytes_mut(), PageKind::Leaf);
-        let e = pool.flush_all().unwrap_err();
-        assert!(e.message.contains("held while the pool flushes"), "{e}");
+        let e = pool.commit(&wal).unwrap_err();
+        assert!(e.message.contains("held while the log is committed"), "{e}");
+    }
+
+    #[test]
+    fn a_page_evicted_before_a_commit_is_still_in_the_log() {
+        // Two frames against many pages, so every page is evicted into the
+        // log before anything commits.
+        let (_dir, pool, wal, file) = pool("evicted", LEAST_FRAMES);
+        let pages: Vec<PageId> = (0..8).map(|_| pool.allocate(file).unwrap()).collect();
+        for id in &pages {
+            stamp(&pool, *id);
+        }
+        pool.commit(&wal).unwrap();
+        for id in &pages {
+            assert_eq!(stamped(&pool, *id), id.page_no);
+        }
+    }
+
+    #[test]
+    fn a_read_at_a_mark_before_a_write_does_not_see_it() {
+        let (_dir, pool, wal, file) = pool("mark", 4);
+        let id = pool.allocate(file).unwrap();
+        stamp(&pool, id);
+        pool.commit(&wal).unwrap();
+        let before = wal.end();
+
+        // The same page again, with a different stamp.
+        {
+            let mut page = pool.fetch(id).unwrap();
+            write_u32(page.bytes_mut(), HEADER_SIZE, 999);
+        }
+        pool.commit(&wal).unwrap();
+
+        assert_eq!(
+            page_u32(
+                &wal.read_page(1, id.page_no, before).unwrap().unwrap(),
+                HEADER_SIZE
+            ),
+            id.page_no,
+            "the mark hides the later frame"
+        );
+        assert_eq!(
+            page_u32(
+                &wal.read_page(1, id.page_no, wal.end()).unwrap().unwrap(),
+                HEADER_SIZE
+            ),
+            999
+        );
     }
 
     #[test]
     fn a_freed_page_is_handed_out_again() {
-        let (_dir, pool, file) = pool("free-list", 4);
+        let (_dir, pool, _wal, file) = pool("free-list", 4);
         let first = pool.allocate(file).unwrap();
         let second = pool.allocate(file).unwrap();
         assert_ne!(first.page_no, second.page_no);
@@ -510,7 +665,7 @@ mod tests {
 
     #[test]
     fn a_free_list_of_more_than_one_page_empties_in_order() {
-        let (_dir, pool, file) = pool("free-many", 4);
+        let (_dir, pool, _wal, file) = pool("free-many", 4);
         let pages: Vec<PageId> = (0..3).map(|_| pool.allocate(file).unwrap()).collect();
         for id in &pages {
             pool.free(*id).unwrap();
@@ -523,7 +678,7 @@ mod tests {
 
     #[test]
     fn the_header_page_is_never_freed() {
-        let (_dir, pool, file) = pool("free-header", 4);
+        let (_dir, pool, _wal, file) = pool("free-header", 4);
         let e = pool.free(PageId::new(file, 0)).unwrap_err();
         assert!(e.message.contains("header of its file"), "{e}");
     }
@@ -542,7 +697,7 @@ mod tests {
         // A pool of 1 MB against 16 MB of pages, so most pages are evicted
         // and read again.
         let frames = 1024 * 1024 / PAGE_SIZE;
-        let (_dir, pool, file) = pool("load", frames);
+        let (_dir, pool, _wal, file) = pool("load", frames);
         let pages = 16 * 1024 * 1024 / PAGE_SIZE;
 
         let mut written = Vec::with_capacity(pages);
@@ -564,7 +719,7 @@ mod tests {
 
     #[test]
     fn the_smallest_pool_still_reads_and_writes() {
-        let (_dir, pool, file) = pool("smallest", 1);
+        let (_dir, pool, _wal, file) = pool("smallest", 1);
         assert_eq!(pool.frame_count(), LEAST_FRAMES);
         let pages: Vec<PageId> = (0..4).map(|_| pool.allocate(file).unwrap()).collect();
         for id in &pages {
@@ -577,7 +732,7 @@ mod tests {
 
     #[test]
     fn a_page_past_the_end_of_its_file_is_an_error() {
-        let (_dir, pool, file) = pool("past-end", 4);
+        let (_dir, pool, _wal, file) = pool("past-end", 4);
         let e = pool.fetch(PageId::new(file, 999)).err().unwrap();
         assert!(e.message.contains("did not read"), "{e}");
     }

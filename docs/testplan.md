@@ -70,6 +70,12 @@ Two failure types. They prove different requirements.
 and it writes that data to the disk after the process stops. To prove [FR57] a test MUST
 discard every write that the server did not force to the disk.
 
+As built, [T10] to [T13] hold in two forms. A `kill -9` of the server proves [FR56] on any
+machine. A test that shortens or corrupts a log file proves that recovery copes with a tail
+that never committed, a frame cut in half, and a checksum that disagrees. The block device
+form below is not built, so [FR57] against a real disk is not yet proven, and a release has to
+say so.
+
 Recommended method: the Linux `dm-log-writes` device. It records each write and each
 flush. A test then rebuilds the disk as it was at any earlier moment, and starts the
 server on that disk. `dm-flakey` is a simpler option that drops unflushed writes.

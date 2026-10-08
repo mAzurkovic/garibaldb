@@ -577,7 +577,22 @@ mod tests {
     use super::*;
     use protocol::DataType;
 
-    use crate::catalog::testing::Dir;
+    use std::sync::Arc;
+
+    use crate::catalog::testing::{self, Dir};
+    use crate::wal::writer::Wal;
+    use crate::wal::{checkpoint, writer::PAGE_FRAME};
+
+    /// Settles the pages written so far and empties the log once it has
+    /// grown, which is what a server does between statements. A run of
+    /// writes that never commits grows the log without bound, and the log
+    /// has a limit.
+    fn settle(pool: &BufferPool, wal: &Arc<Wal>) {
+        pool.commit(wal).expect("the pages commit");
+        if wal.end() > 4 * 1024 * 1024 {
+            checkpoint::run(pool, wal).expect("the checkpoint runs");
+        }
+    }
 
     /// A table of a key column and a label, keyed by the first.
     fn table(ty: DataType) -> TableDef {
@@ -633,11 +648,8 @@ mod tests {
         codec::encode_row(&table.columns, &cells).expect("the row encodes")
     }
 
-    fn fixture(label: &str, frames: usize) -> (Dir, BufferPool, FileId) {
-        let dir = Dir::new(label);
-        let pool = BufferPool::with_frames(frames);
-        let file = pool.open(&dir.0.join("1.tbl")).expect("the file opens");
-        (dir, pool, file)
+    fn fixture(label: &str, frames: usize) -> (Dir, BufferPool, Arc<Wal>, FileId) {
+        testing::table(label, frames)
     }
 
     fn row(table: &TableDef, key: Value, label: &str) -> Vec<u8> {
@@ -692,7 +704,7 @@ mod tests {
 
     #[test]
     fn an_empty_tree_holds_nothing() {
-        let (_dir, pool, file) = fixture("empty", 8);
+        let (_dir, pool, _wal, file) = fixture("empty", 8);
         let table = table(DataType::Integer);
         let tree = BTree::open(&pool, file, &table);
         assert_eq!(tree.get(&Value::Integer(1)).unwrap(), None);
@@ -702,7 +714,7 @@ mod tests {
 
     #[test]
     fn a_key_reads_back_through_an_interior_entry() {
-        let (_dir, pool, file) = fixture("entry", 8);
+        let (_dir, pool, _wal, file) = fixture("entry", 8);
         for (ty, key) in [
             (DataType::Integer, Value::Integer(-7)),
             (DataType::Text, Value::Text("hé".to_string())),
@@ -729,7 +741,7 @@ mod tests {
 
     #[test]
     fn a_search_finds_every_key_of_a_page_and_places_the_rest() {
-        let (_dir, pool, file) = fixture("search", 8);
+        let (_dir, pool, _wal, file) = fixture("search", 8);
         let table = table(DataType::Integer);
         let tree = BTree::open(&pool, file, &table);
         // Even keys only, so every odd key is one that is not there.
@@ -755,7 +767,7 @@ mod tests {
 
     #[test]
     fn a_search_of_an_empty_page_gives_the_first_slot() {
-        let (_dir, pool, file) = fixture("search-empty", 8);
+        let (_dir, pool, _wal, file) = fixture("search-empty", 8);
         let table = table(DataType::Integer);
         let tree = BTree::open(&pool, file, &table);
         let mut page = Box::new([0; PAGE_SIZE]);
@@ -774,7 +786,7 @@ mod tests {
             ("reversed", (0..300).rev().collect()),
             ("shuffled", shuffled(300)),
         ] {
-            let (_dir, pool, file) = fixture(label, 8);
+            let (_dir, pool, _wal, file) = fixture(label, 8);
             let table = table(DataType::Integer);
             let tree = BTree::open(&pool, file, &table);
             for key in &order {
@@ -793,7 +805,7 @@ mod tests {
 
     #[test]
     fn enough_rows_make_a_tree_of_more_than_one_level() {
-        let (_dir, pool, file) = fixture("levels", 16);
+        let (_dir, pool, _wal, file) = fixture("levels", 16);
         let table = table(DataType::Integer);
         let tree = BTree::open(&pool, file, &table);
         tree.insert(&int_row(&table, 1)).unwrap();
@@ -808,15 +820,19 @@ mod tests {
     #[test]
     fn a_tree_deep_enough_to_split_an_interior_page_stays_in_order() {
         // Wide rows, so few fit a leaf and the leaves alone fill the root.
-        let (_dir, pool, file) = fixture("deep", 32);
+        let (_dir, pool, wal, file) = fixture("deep", 32);
         let table = table(DataType::Integer);
         let tree = BTree::open(&pool, file, &table);
         let wide = "x".repeat(400);
         let count = 15_000;
-        for key in shuffled(count) {
+        for (written, key) in shuffled(count).into_iter().enumerate() {
             tree.insert(&row(&table, Value::Integer(key), &wide))
                 .unwrap();
+            if written % 500 == 0 {
+                settle(&pool, &wal);
+            }
         }
+        settle(&pool, &wal);
         assert_eq!(keys(&tree), (0..count).collect::<Vec<i64>>());
         // The root split at least once, so the tree is three levels deep.
         let root = tree.root().unwrap();
@@ -846,7 +862,7 @@ mod tests {
             ),
         ];
         for (ty, key) in cases {
-            let (_dir, pool, file) = fixture(&format!("duplicate-{ty}"), 8);
+            let (_dir, pool, _wal, file) = fixture(&format!("duplicate-{ty}"), 8);
             let table = table(ty);
             let tree = BTree::open(&pool, file, &table);
             tree.insert(&row(&table, key.clone(), "first")).unwrap();
@@ -862,7 +878,7 @@ mod tests {
 
     #[test]
     fn a_decimal_key_of_the_same_value_written_differently_is_a_duplicate() {
-        let (_dir, pool, file) = fixture("decimal-key", 8);
+        let (_dir, pool, _wal, file) = fixture("decimal-key", 8);
         let table = table(DataType::Decimal { p: 10, s: 2 });
         let tree = BTree::open(&pool, file, &table);
         tree.insert(&row(&table, Value::Decimal("12.20".parse().unwrap()), "a"))
@@ -880,7 +896,7 @@ mod tests {
 
     #[test]
     fn a_row_that_no_page_could_hold_is_refused() {
-        let (_dir, pool, file) = fixture("too-wide", 8);
+        let (_dir, pool, _wal, file) = fixture("too-wide", 8);
         let table = wide_table(5);
         let tree = BTree::open(&pool, file, &table);
         let row = wide_row(&table, 1);
@@ -891,7 +907,7 @@ mod tests {
 
     #[test]
     fn a_row_that_only_just_fits_a_page_goes_in() {
-        let (_dir, pool, file) = fixture("just-fits", 8);
+        let (_dir, pool, _wal, file) = fixture("just-fits", 8);
         let table = wide_table(3);
         let tree = BTree::open(&pool, file, &table);
         assert!(
@@ -915,7 +931,7 @@ mod tests {
 
     #[test]
     fn a_page_of_one_record_cannot_be_split() {
-        let (_dir, pool, file) = fixture("no-split", 8);
+        let (_dir, pool, _wal, file) = fixture("no-split", 8);
         let table = table(DataType::Integer);
         let tree = BTree::open(&pool, file, &table);
         let leaf = tree.plant().unwrap();
@@ -925,7 +941,7 @@ mod tests {
 
     #[test]
     fn every_bound_takes_and_leaves_the_right_rows() {
-        let (_dir, pool, file) = fixture("bounds", 8);
+        let (_dir, pool, _wal, file) = fixture("bounds", 8);
         let table = table(DataType::Integer);
         let tree = BTree::open(&pool, file, &table);
         for key in 0..200 {
@@ -966,7 +982,7 @@ mod tests {
 
     #[test]
     fn a_scan_crosses_every_leaf_of_a_tree() {
-        let (_dir, pool, file) = fixture("cross", 4);
+        let (_dir, pool, _wal, file) = fixture("cross", 4);
         let table = table(DataType::Integer);
         let tree = BTree::open(&pool, file, &table);
         for key in 0..600 {
@@ -979,7 +995,7 @@ mod tests {
 
     #[test]
     fn a_deleted_key_is_gone_from_a_read_and_from_a_scan() {
-        let (_dir, pool, file) = fixture("delete-one", 8);
+        let (_dir, pool, _wal, file) = fixture("delete-one", 8);
         let table = table(DataType::Integer);
         let tree = BTree::open(&pool, file, &table);
         for key in 0..100 {
@@ -998,7 +1014,7 @@ mod tests {
 
     #[test]
     fn deleting_every_key_empties_the_tree_and_gives_the_pages_back() {
-        let (_dir, pool, file) = fixture("delete-all", 8);
+        let (_dir, pool, _wal, file) = fixture("delete-all", 8);
         let table = table(DataType::Integer);
         let tree = BTree::open(&pool, file, &table);
         for key in 0..400 {
@@ -1027,7 +1043,7 @@ mod tests {
 
     #[test]
     fn deleting_half_the_keys_leaves_the_rest_in_order() {
-        let (_dir, pool, file) = fixture("delete-half", 8);
+        let (_dir, pool, _wal, file) = fixture("delete-half", 8);
         let table = table(DataType::Integer);
         let tree = BTree::open(&pool, file, &table);
         for key in shuffled(1000) {
@@ -1051,31 +1067,39 @@ mod tests {
     #[test]
     fn fifty_thousand_keys_go_in_at_random_and_read_back_in_order() {
         // A pool far smaller than the tree, so pages are evicted throughout.
-        let (_dir, pool, file) = fixture("load", 64);
+        let (_dir, pool, wal, file) = fixture("load", 64);
         let table = table(DataType::Integer);
         let tree = BTree::open(&pool, file, &table);
         let count = 50_000;
-        for key in shuffled(count) {
+        for (written, key) in shuffled(count).into_iter().enumerate() {
             tree.insert(&int_row(&table, key)).unwrap();
+            if written % 1000 == 0 {
+                settle(&pool, &wal);
+            }
         }
+        settle(&pool, &wal);
         assert_eq!(keys(&tree), (0..count).collect::<Vec<i64>>());
         assert!(
             pool.held() <= pool.frame_count(),
             "the pool grew past its cap"
         );
 
-        for key in (0..count).step_by(2) {
+        for (gone, key) in (0..count).step_by(2).enumerate() {
             tree.delete(&Value::Integer(key))
                 .unwrap()
                 .expect("the key was there");
+            if gone % 1000 == 0 {
+                settle(&pool, &wal);
+            }
         }
+        settle(&pool, &wal);
         assert_eq!(keys(&tree), (1..count).step_by(2).collect::<Vec<i64>>());
         assert_eq!(pool.held(), pool.frame_count());
     }
 
     #[test]
     fn a_row_whose_key_is_null_is_refused() {
-        let (_dir, pool, file) = fixture("null-key", 8);
+        let (_dir, pool, _wal, file) = fixture("null-key", 8);
         let table = table(DataType::Integer);
         let tree = BTree::open(&pool, file, &table);
         let row = codec::encode_row(
@@ -1089,7 +1113,7 @@ mod tests {
 
     #[test]
     fn a_key_that_lives_in_a_chain_is_refused() {
-        let (_dir, pool, file) = fixture("chain-key", 8);
+        let (_dir, pool, _wal, file) = fixture("chain-key", 8);
         // A key column of text could in principle hold a value too large for
         // a record, and a key the tree cannot read is no key at all.
         let table = table(DataType::Text);
@@ -1108,7 +1132,7 @@ mod tests {
 
     #[test]
     fn a_page_that_is_no_part_of_a_tree_is_an_error() {
-        let (_dir, pool, file) = fixture("wrong-kind", 8);
+        let (_dir, pool, _wal, file) = fixture("wrong-kind", 8);
         let table = table(DataType::Integer);
         let tree = BTree::open(&pool, file, &table);
         tree.insert(&int_row(&table, 1)).unwrap();
@@ -1130,7 +1154,7 @@ mod tests {
 
     #[test]
     fn an_emptied_leaf_is_unlinked_from_the_leaf_before_it() {
-        let (_dir, pool, file) = fixture("unlink-middle", 8);
+        let (_dir, pool, _wal, file) = fixture("unlink-middle", 8);
         let table = table(DataType::Integer);
         let tree = BTree::open(&pool, file, &table);
         for key in 0..400 {
@@ -1157,6 +1181,40 @@ mod tests {
             compare(&Value::Integer(1), &Value::Integer(2)).unwrap(),
             Ordering::Less
         );
+    }
+
+    #[test]
+    fn a_run_of_writes_that_never_commits_fills_the_log() {
+        // A log of room for a few hundred frames, and a pool small enough
+        // that every write evicts a page into it.
+        let dir = Dir::new("log-full");
+        let pool = BufferPool::with_frames(2);
+        let wal = Arc::new(Wal::open(&dir.0, 200 * PAGE_FRAME as u64).unwrap());
+        let file = pool
+            .open(&dir.0.join("1.tbl"), 1, Arc::clone(&wal))
+            .unwrap();
+        let table = table(DataType::Integer);
+        let tree = BTree::open(&pool, file, &table);
+
+        // One transaction holds its whole change set in the log, so a long
+        // enough one runs out of log.
+        let mut written = 0;
+        let full = loop {
+            match tree.insert(&int_row(&table, written)) {
+                Ok(()) => written += 1,
+                Err(e) => break e,
+            }
+            assert!(written < 10_000, "the log never filled");
+        };
+        assert_eq!(full.code, ErrorCode::StorageFull);
+        assert!(written > 0, "something went in before the log filled");
+
+        // Reads do not carry on here, and a pool this small is why. Taking a
+        // frame can mean evicting a page that was changed, and a changed page
+        // has nowhere to go while the log is full. Nothing can drop those
+        // pages until there is a transaction to abort, which is milestone 10.
+        // A pool of a realistic size holds clean frames to take instead.
+        assert_eq!(pool.frame_count(), 2);
     }
 
     /// The keys 0 to `count`, in an order that is not sorted and repeats each

@@ -17,6 +17,7 @@ use crate::store::btree::BTree;
 use crate::store::page::FileId;
 use crate::store::pool::BufferPool;
 use crate::store::row::{self, Row};
+use crate::wal::checkpoint;
 
 /// What a statement did.
 pub enum Answer<'a> {
@@ -39,7 +40,10 @@ pub fn run<'a>(
 ) -> Result<Answer<'a>, DbError> {
     let answer = dispatch(statement, db, registry)?;
     if let Answer::Changed { .. } = &answer {
-        registry.pool().flush_all()?;
+        registry.pool().commit(&db.wal)?;
+        if db.wal.end() > checkpoint::THRESHOLD {
+            checkpoint::run(registry.pool(), &db.wal)?;
+        }
     }
     Ok(answer)
 }
@@ -132,7 +136,7 @@ fn insert(
     given: &[Vec<Value>],
 ) -> Result<u64, DbError> {
     let table = table_of(db, name)?;
-    let file = registry.table_file(&db.name, &table)?;
+    let file = registry.table_file(db, &table)?;
     let pool = registry.pool();
     let at = positions(&table, named_columns)?;
 
@@ -187,7 +191,7 @@ fn select<'a>(
     limit: Option<u64>,
 ) -> Result<Box<dyn Operator + 'a>, DbError> {
     let table = table_of(db, name)?;
-    let file = registry.table_file(&db.name, &table)?;
+    let file = registry.table_file(db, &table)?;
     planner::plan(&table, selection, condition, limit, registry.pool(), file)
 }
 
@@ -200,7 +204,7 @@ fn update(
     condition: Option<&Expr>,
 ) -> Result<u64, DbError> {
     let table = table_of(db, name)?;
-    let file = registry.table_file(&db.name, &table)?;
+    let file = registry.table_file(db, &table)?;
     let pool = registry.pool();
     let tree = BTree::open(pool, file, &table);
 
@@ -242,7 +246,7 @@ fn delete(
     condition: Option<&Expr>,
 ) -> Result<u64, DbError> {
     let table = table_of(db, name)?;
-    let file = registry.table_file(&db.name, &table)?;
+    let file = registry.table_file(db, &table)?;
     let pool = registry.pool();
     let tree = BTree::open(pool, file, &table);
 
@@ -862,6 +866,25 @@ mod tests {
             .unwrap()
             .code,
             ErrorCode::TypeMismatch
+        );
+    }
+
+    #[test]
+    fn the_log_keeps_what_came_before_and_is_not_emptied_by_each_statement() {
+        let (_dir, registry, held) = shop("log-growth");
+        item(&held, &registry);
+        let after_create = held.db.wal.end();
+        assert!(after_create > 0, "the table reached the log");
+
+        changed(
+            "INSERT INTO item (id, label) VALUES (1, 'a')",
+            &held,
+            &registry,
+        )
+        .unwrap();
+        assert!(
+            held.db.wal.end() > after_create,
+            "a checkpoint runs on size, not on every statement"
         );
     }
 

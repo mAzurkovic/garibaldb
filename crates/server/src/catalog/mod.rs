@@ -14,10 +14,12 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use protocol::{DataType, DbError, ErrorCode};
 use serde::{Deserialize, Serialize};
+
+use crate::wal::writer::Wal;
 
 /// The schema file of a database.
 const FILE: &str = "catalog.json";
@@ -187,12 +189,12 @@ impl Catalog {
     }
 }
 
-/// One database: its name and its schema. The write lock, the WAL, and the
-/// buffer pool join it in milestones 10, 9, and 6.
-#[derive(Debug)]
+/// One database: its name, its schema, and the log its writes go through.
+/// The write lock joins it in milestone 10.
 pub struct Database {
     pub name: String,
     pub catalog: Mutex<Catalog>,
+    pub wal: Arc<Wal>,
 }
 
 #[cfg(test)]

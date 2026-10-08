@@ -14,6 +14,7 @@ use protocol::{DbError, ErrorCode};
 use crate::catalog::{Catalog, Database, TableDef, named};
 use crate::store::page::FileId;
 use crate::store::pool::BufferPool;
+use crate::wal::writer::Wal;
 
 /// The database a new data directory gets. A client must name a database to
 /// connect, so a directory that holds none could never be reached.
@@ -21,7 +22,7 @@ pub const FIRST_DATABASE: &str = "default";
 
 /// What the registry holds under one lock, so the count and the map never
 /// disagree about a database.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct State {
     open: HashMap<String, Arc<Database>>,
     /// How many connections hold each database. A database with no
@@ -36,17 +37,20 @@ pub struct Registry {
     /// One pool for the whole server, because the memory limit is for the
     /// whole server.
     pool: BufferPool,
+    /// How large the log of a database may grow.
+    wal_limit: u64,
 }
 
 impl Registry {
     /// Opens the data directory, making it when it is not there yet. The
     /// memory limit sizes the one pool that every database reads through.
-    pub fn new(data_dir: &Path, mem_limit: u64) -> io::Result<Registry> {
+    pub fn new(data_dir: &Path, mem_limit: u64, wal_limit: u64) -> io::Result<Registry> {
         fs::create_dir_all(data_dir)?;
         Ok(Registry {
             data_dir: data_dir.to_path_buf(),
             state: Mutex::new(State::default()),
             pool: BufferPool::new(mem_limit),
+            wal_limit,
         })
     }
 
@@ -56,9 +60,47 @@ impl Registry {
 
     /// The file that holds the rows of a table. The pool hands out the same
     /// id for a table it has already opened.
-    pub fn table_file(&self, database: &str, table: &TableDef) -> Result<FileId, DbError> {
-        self.pool
-            .open(&self.data_dir.join(database).join(table.file_name()))
+    pub fn table_file(&self, db: &Database, table: &TableDef) -> Result<FileId, DbError> {
+        self.pool.open(
+            &self.data_dir.join(&db.name).join(table.file_name()),
+            table.id,
+            Arc::clone(&db.wal),
+        )
+    }
+
+    /// Opens every database, which recovers each log. Connections wait for
+    /// this, because a client must never read a page that recovery is about
+    /// to take away.
+    pub fn recover(&self) -> io::Result<()> {
+        for dir in self.database_dirs()? {
+            let Some(name) = dir_name(&dir) else { continue };
+            log::info!("recovering database {name}");
+            self.database(name).map_err(io::Error::other)?;
+            log::info!("recovered database {name}");
+        }
+        Ok(())
+    }
+
+    /// The database of a name, opening and recovering it the first time.
+    fn database(&self, name: &str) -> Result<Arc<Database>, DbError> {
+        let dir = self.dir_of(name)?;
+        let mut state = self.state.lock().expect("the registry lock holds");
+        if let Some(db) = state.open.get(name) {
+            return Ok(Arc::clone(db));
+        }
+        let catalog = Catalog::load(&dir).map_err(|e| {
+            named(
+                ErrorCode::UnknownDatabase,
+                format!("database {name} did not open: {e}"),
+            )
+        })?;
+        let db = Arc::new(Database {
+            name: name.to_string(),
+            catalog: Mutex::new(catalog),
+            wal: Arc::new(Wal::open(&dir, self.wal_limit)?),
+        });
+        state.open.insert(name.to_string(), Arc::clone(&db));
+        Ok(db)
     }
 
     /// Takes a database for one connection. A client sees only this database,
@@ -66,25 +108,8 @@ impl Registry {
     /// `DROP DATABASE` through.
     pub fn connect(registry: &Arc<Registry>, name: &str) -> Result<Connected, DbError> {
         check_name(name)?;
-        let dir = registry.dir_of(name)?;
+        let db = registry.database(name)?;
         let mut state = registry.state.lock().expect("the registry lock holds");
-        let db = match state.open.get(name) {
-            Some(db) => Arc::clone(db),
-            None => {
-                let catalog = Catalog::load(&dir).map_err(|e| {
-                    named(
-                        ErrorCode::UnknownDatabase,
-                        format!("database {name} did not open: {e}"),
-                    )
-                })?;
-                let db = Arc::new(Database {
-                    name: name.to_string(),
-                    catalog: Mutex::new(catalog),
-                });
-                state.open.insert(name.to_string(), Arc::clone(&db));
-                db
-            }
-        };
         *state.connections.entry(name.to_string()).or_insert(0) += 1;
         Ok(Connected {
             db,
@@ -295,9 +320,10 @@ mod tests {
             ..first.clone()
         };
 
-        let file = registry.table_file("shop", &first).unwrap();
-        assert_eq!(registry.table_file("shop", &first).unwrap(), file);
-        assert_ne!(registry.table_file("shop", &second).unwrap(), file);
+        let held = Registry::connect(&registry, "shop").unwrap();
+        let file = registry.table_file(&held.db, &first).unwrap();
+        assert_eq!(registry.table_file(&held.db, &first).unwrap(), file);
+        assert_ne!(registry.table_file(&held.db, &second).unwrap(), file);
         assert!(dir.0.join("shop").join("1.tbl").is_file());
         assert!(dir.0.join("shop").join("2.tbl").is_file());
     }
@@ -314,9 +340,11 @@ mod tests {
             columns: Vec::new(),
             pk_index: 0,
         };
+        let shop = Registry::connect(&registry, "shop").unwrap();
+        let other = Registry::connect(&registry, "other").unwrap();
         assert_ne!(
-            registry.table_file("shop", &table).unwrap(),
-            registry.table_file("other", &table).unwrap()
+            registry.table_file(&shop.db, &table).unwrap(),
+            registry.table_file(&other.db, &table).unwrap()
         );
         assert!(dir.0.join("other").join("1.tbl").is_file());
     }

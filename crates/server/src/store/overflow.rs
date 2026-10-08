@@ -86,15 +86,15 @@ pub fn free(pool: &BufferPool, file: FileId, ptr: ChainPtr) -> Result<(), DbErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::testing::Dir;
+    use std::sync::Arc;
+
+    use crate::catalog::testing::{self, Dir};
     use crate::store::codec::INLINE_LIMIT;
     use crate::store::page::SlottedPage;
+    use crate::wal::writer::Wal;
 
-    fn pool(label: &str, frames: usize) -> (Dir, BufferPool, FileId) {
-        let dir = Dir::new(label);
-        let pool = BufferPool::with_frames(frames);
-        let file = pool.open(&dir.0.join("1.tbl")).expect("the file opens");
-        (dir, pool, file)
+    fn pool(label: &str, frames: usize) -> (Dir, BufferPool, Arc<Wal>, FileId) {
+        testing::table(label, frames)
     }
 
     /// The page that follows one page of a chain.
@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn a_value_of_a_megabyte_reads_back_byte_for_byte() {
-        let (_dir, pool, file) = pool("megabyte", 8);
+        let (_dir, pool, _wal, file) = pool("megabyte", 8);
         let value: Vec<u8> = (0..1024 * 1024).map(|n| (n % 251) as u8).collect();
         let ptr = write(&pool, file, &value).unwrap();
         assert_eq!(ptr.len, value.len() as u64);
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn a_value_just_over_the_record_limit_takes_one_page() {
-        let (_dir, pool, file) = pool("one-page", 4);
+        let (_dir, pool, _wal, file) = pool("one-page", 4);
         let value = vec![7; INLINE_LIMIT + 1];
         let ptr = write(&pool, file, &value).unwrap();
         assert_eq!(
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn a_value_that_exactly_fills_its_pages_reads_back() {
-        let (_dir, pool, file) = pool("exact", 4);
+        let (_dir, pool, _wal, file) = pool("exact", 4);
         for pages in 1..4 {
             let value = vec![3; PER_PAGE * pages];
             let ptr = write(&pool, file, &value).unwrap();
@@ -144,7 +144,7 @@ mod tests {
     fn a_chain_survives_the_eviction_of_its_middle() {
         // Two frames against a chain of many pages, so each page is read
         // again after its frame was reused.
-        let (_dir, pool, file) = pool("evicted", 1);
+        let (_dir, pool, _wal, file) = pool("evicted", 1);
         let value: Vec<u8> = (0..PER_PAGE as u32 * 5).map(|n| (n % 253) as u8).collect();
         let ptr = write(&pool, file, &value).unwrap();
         assert_eq!(read(&pool, file, ptr).unwrap(), value);
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn a_freed_chain_gives_every_page_back() {
-        let (_dir, pool, file) = pool("freed", 4);
+        let (_dir, pool, _wal, file) = pool("freed", 4);
         let value = vec![1; PER_PAGE * 3];
         let ptr = write(&pool, file, &value).unwrap();
         let after_write = pool.allocate(file).unwrap().page_no;
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn an_empty_value_needs_no_page() {
-        let (_dir, pool, file) = pool("empty", 4);
+        let (_dir, pool, _wal, file) = pool("empty", 4);
         let ptr = write(&pool, file, &[]).unwrap();
         assert_eq!(ptr, ChainPtr { head: 0, len: 0 });
         assert_eq!(read(&pool, file, ptr).unwrap(), Vec::<u8>::new());
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn a_chain_that_ends_too_soon_is_an_error() {
-        let (_dir, pool, file) = pool("short", 4);
+        let (_dir, pool, _wal, file) = pool("short", 4);
         let ptr = write(&pool, file, &vec![1; PER_PAGE]).unwrap();
         // The record claims more than the chain holds.
         let lying = ChainPtr {
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn a_chain_that_reaches_another_kind_of_page_is_an_error() {
-        let (_dir, pool, file) = pool("wrong-kind", 4);
+        let (_dir, pool, _wal, file) = pool("wrong-kind", 4);
         let id = pool.allocate(file).unwrap();
         SlottedPage::init(pool.fetch(id).unwrap().bytes_mut(), PageKind::Leaf);
         let e = read(
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn a_chain_that_starts_nowhere_is_an_error() {
-        let (_dir, pool, file) = pool("no-head", 4);
+        let (_dir, pool, _wal, file) = pool("no-head", 4);
         let e = read(&pool, file, ChainPtr { head: 0, len: 1 })
             .err()
             .unwrap();

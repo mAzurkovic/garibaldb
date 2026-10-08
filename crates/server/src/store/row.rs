@@ -103,8 +103,11 @@ mod tests {
     use protocol::{DataType, Decimal};
 
     use super::*;
-    use crate::catalog::testing::Dir;
+    use std::sync::Arc;
+
+    use crate::catalog::testing::{self, Dir};
     use crate::store::page::PAGE_SIZE;
+    use crate::wal::writer::Wal;
 
     fn column(name: &str, ty: DataType) -> ColumnDef {
         ColumnDef {
@@ -114,11 +117,8 @@ mod tests {
         }
     }
 
-    fn fixture(label: &str) -> (Dir, BufferPool, FileId) {
-        let dir = Dir::new(label);
-        let pool = BufferPool::with_frames(16);
-        let file = pool.open(&dir.0.join("1.tbl")).expect("the file opens");
-        (dir, pool, file)
+    fn fixture(label: &str) -> (Dir, BufferPool, Arc<Wal>, FileId) {
+        testing::table(label, 16)
     }
 
     /// How many pages the file holds, which says whether a free gave any back.
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn every_type_reads_back_from_its_bytes() {
-        let (_dir, pool, file) = fixture("types");
+        let (_dir, pool, _wal, file) = fixture("types");
         let columns = vec![
             column("i", DataType::Integer),
             column("t", DataType::Text),
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn a_value_of_a_megabyte_goes_to_a_chain_and_comes_back() {
-        let (_dir, pool, file) = fixture("megabyte");
+        let (_dir, pool, _wal, file) = fixture("megabyte");
         let columns = vec![column("t", DataType::Text)];
         let text = "x".repeat(1024 * 1024);
         let values = vec![Value::Text(text.clone())];
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn a_value_at_the_inline_limit_stays_in_the_record() {
-        let (_dir, pool, file) = fixture("inline");
+        let (_dir, pool, _wal, file) = fixture("inline");
         let columns = vec![column("t", DataType::Text)];
         let values = vec![Value::Text("x".repeat(codec::INLINE_LIMIT))];
         let before = pages(&pool, file);
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn a_row_of_a_hundred_columns_reads_back() {
-        let (_dir, pool, file) = fixture("hundred");
+        let (_dir, pool, _wal, file) = fixture("hundred");
         let columns: Vec<ColumnDef> = (0..100)
             .map(|n| column(&format!("c{n}"), DataType::Integer))
             .collect();
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn a_row_too_wide_for_a_page_is_refused_and_leaves_no_chain() {
-        let (_dir, pool, file) = fixture("too-wide");
+        let (_dir, pool, _wal, file) = fixture("too-wide");
         // One value over the inline limit, which takes a chain, and four at
         // the limit, which stay in the record and together outgrow a page.
         let columns: Vec<ColumnDef> = (0..5)
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn a_value_of_the_wrong_type_is_refused_and_leaves_no_chain() {
-        let (_dir, pool, file) = fixture("wrong-type");
+        let (_dir, pool, _wal, file) = fixture("wrong-type");
         let columns = vec![column("t", DataType::Text), column("i", DataType::Integer)];
         let before = pages(&pool, file);
         let values = vec![
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn freeing_a_row_gives_the_pages_of_its_chains_back() {
-        let (_dir, pool, file) = fixture("free");
+        let (_dir, pool, _wal, file) = fixture("free");
         let columns = vec![column("t", DataType::Text)];
         let values = vec![Value::Text("x".repeat(PAGE_SIZE * 3))];
         let bytes = store(&pool, file, &columns, &values).unwrap();
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn freeing_a_row_that_holds_no_chain_frees_nothing() {
-        let (_dir, pool, file) = fixture("free-none");
+        let (_dir, pool, _wal, file) = fixture("free-none");
         let columns = vec![column("i", DataType::Integer)];
         let bytes = store(&pool, file, &columns, &[Value::Integer(1)]).unwrap();
         let before = pages(&pool, file);
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn a_chain_that_holds_text_which_is_not_utf8_is_an_error() {
-        let (_dir, pool, file) = fixture("not-utf8");
+        let (_dir, pool, _wal, file) = fixture("not-utf8");
         let columns = vec![column("t", DataType::Text)];
         // A chain written by hand, holding bytes no string could hold.
         let ptr = overflow::write(&pool, file, &[0xff; 4096]).unwrap();
