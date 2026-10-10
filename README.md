@@ -37,10 +37,12 @@ No `JOIN`, no indexes, no aggregates, no replication, no authentication.
 
 ## Status
 
-Milestone 10 of 12 done. It is a transactional database: `BEGIN`, `COMMIT` and `ROLLBACK` work,
-one writer at a time holds each database, a read-only transaction reads a snapshot and waits for
-no one, and none of the six known isolation anomalies occurs. A power cut against a real disk
-stays unproven. `ORDER BY` arrives in milestone 11.
+Milestone 11 of 12 done. Every query requirement is answered: `ORDER BY` on any column sorts
+larger than memory by spilling to `tmp/`, an order on the primary key reads the B-tree in either
+direction and sorts nothing, and a client can stop a statement while it runs. One writer at a
+time holds each database, a read-only transaction reads a snapshot and waits for no one, and none
+of the six known isolation anomalies occurs. A power cut against a real disk stays unproven, and
+the capacity figures of the requirements are milestone 12's.
 See [docs/projectplan.md](docs/projectplan.md).
 
 ## Build

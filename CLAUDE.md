@@ -59,7 +59,7 @@ in one of these:
   suites (`[S1]`-`[S17]`), and rules like "a test MUST use the network protocol, MUST NOT read a
   data file" (`[TR3]`) and "MUST start from an empty server" (`[TR5]`).
 - **`docs/projectplan.md`** — the 12 milestones, their scope, dependencies, and "done when"
-  criteria. Current status: milestone 10 of 12 done (see README "Status" and the latest commit).
+  criteria. Current status: milestone 11 of 12 done (see README "Status" and the latest commit).
 - **`.specs/milestone-N-*/tasks.md`** — the working checklist for a given milestone, generated
   from projectplan.md. Tasks already checked `[x]` are "settled, do not reopen" — notably each
   file has a "Settled before this list" section calling out decisions not to revisit.
