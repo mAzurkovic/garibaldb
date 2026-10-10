@@ -10,8 +10,6 @@
 
 mod h1;
 
-use std::time::Duration;
-
 use protocol::{ClientMsg, ErrorCode, PROTOCOL_VERSION, ServerMsg, TxState};
 
 use h1::{Conn, DataDir, Server, startup, wait_log};
@@ -525,25 +523,29 @@ fn sort_files(data_dir: &std::path::Path) -> usize {
 /// with its own code and the connection carries the next one.
 #[test]
 fn a_cancel_stops_a_statement_and_leaves_the_connection_open() {
-    const ROWS: i64 = 20_000;
+    const ROWS: i64 = 5000;
     let data = DataDir::new("cancel-socket");
-    // A sort has to read every row of the table before it hands back the
-    // first one, so the work is the whole scan and nothing of the answer
-    // depends on how much the socket of the asking connection will hold.
     let server = Server::start_on(&data.0, &["--sort-bytes", "65536"]);
     let mut conn = server.connect();
     let (conn_id, secret) = conn.start_up();
     conn.run("CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL)");
-    conn.run(&bulk(ROWS));
+    let written = conn.run(&bulk(ROWS));
+    assert!(
+        written
+            .iter()
+            .any(|msg| matches!(msg, ServerMsg::Complete { rows, .. } if *rows == ROWS as u64)),
+        "the rows go in: {written:?}"
+    );
 
     conn.send(&ClientMsg::Query {
         sql: "SELECT label FROM item ORDER BY label".to_string(),
     });
-    // The server clears the flag when it reads a statement, so one cancel
-    // stops one statement and no more. A cancel that beat that read would be
-    // wiped by it, and there is no message that says a statement has begun,
-    // so the test waits out the read and lands inside the sort instead.
-    std::thread::sleep(Duration::from_millis(25));
+    // The columns of an answer go out before its rows, and a sort reads every
+    // row of the table before it hands back the first. So this says the
+    // server has read the statement, which is when it clears the flag, and
+    // that it has the whole scan still to do.
+    assert!(matches!(conn.expect(), ServerMsg::RowDesc { .. }));
+
     let mut canceller = server.connect();
     canceller.send(&ClientMsg::Cancel {
         conn_id,
@@ -560,7 +562,7 @@ fn a_cancel_stops_a_statement_and_leaves_the_connection_open() {
             _ => {}
         }
     };
-    assert_eq!(code, Some(ErrorCode::Cancelled));
+    assert_eq!(code, Some(ErrorCode::Cancelled), "{rows} rows went out");
     assert_eq!(rows, 0, "a sort writes nothing until it has every row");
     assert_eq!(sort_files(&data.0), 0, "the runs went with the statement");
 
