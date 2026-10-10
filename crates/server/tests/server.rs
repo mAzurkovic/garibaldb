@@ -364,3 +364,105 @@ fn a_read_of_a_column_that_is_not_there_answers_an_error() {
     // The session is still good.
     assert_eq!(kind_of(&conn.run("SELECT id FROM item")), "SELECT");
 }
+
+/// Every value of one column, as integers.
+fn ids(answer: &[ServerMsg]) -> Vec<i64> {
+    answer
+        .iter()
+        .filter_map(|msg| match msg {
+            ServerMsg::DataRow { values } => match values.first() {
+                Some(protocol::Value::Integer(id)) => Some(*id),
+                other => panic!("expected an integer, got {other:?}"),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// The transaction state of the `Ready` that closed an answer.
+fn state(answer: &[ServerMsg]) -> TxState {
+    answer
+        .iter()
+        .find_map(|msg| match msg {
+            ServerMsg::Ready { tx, .. } => Some(*tx),
+            _ => None,
+        })
+        .expect("every answer ends with a ready")
+}
+
+/// What a transaction committed is there after a restart, and what it rolled
+/// back was never there.
+#[test]
+fn a_restart_keeps_what_committed_and_nothing_else() {
+    let data = DataDir::new("txn-restart");
+
+    let first = Server::start_on(&data.0, &[]);
+    let mut conn = first.connect();
+    conn.start_up();
+    conn.run("CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL)");
+    conn.run("BEGIN");
+    conn.run("INSERT INTO item (id, label) VALUES (1, 'apple'), (2, 'pear')");
+    conn.run("COMMIT");
+    conn.run("BEGIN");
+    conn.run("INSERT INTO item (id, label) VALUES (3, 'plum')");
+    conn.run("DELETE FROM item WHERE id = 1");
+    conn.run("ROLLBACK");
+    drop(conn);
+    drop(first);
+
+    let second = Server::start_on(&data.0, &[]);
+    let mut conn = second.connect();
+    conn.start_up();
+    assert_eq!(ids(&conn.run("SELECT id FROM item")), vec![1, 2]);
+}
+
+/// A client that leaves mid-transaction keeps none of it, and the next client
+/// is free to write.
+#[test]
+fn a_disconnect_rolls_back_the_open_transaction() {
+    let data = DataDir::new("txn-disconnect");
+    let server = Server::start_on(&data.0, &[]);
+
+    let mut conn = server.connect();
+    conn.start_up();
+    conn.run("CREATE TABLE item (id INTEGER PRIMARY KEY)");
+    conn.run("INSERT INTO item (id) VALUES (1)");
+    conn.run("BEGIN");
+    conn.run("INSERT INTO item (id) VALUES (2)");
+    drop(conn);
+
+    let mut next = server.connect();
+    next.start_up();
+    // The write lock came back with the connection that held it.
+    next.run("INSERT INTO item (id) VALUES (3)");
+    assert_eq!(ids(&next.run("SELECT id FROM item")), vec![1, 3]);
+}
+
+/// `Ready` says what the connection holds, so a client knows whether it is in
+/// a transaction without keeping count itself.
+#[test]
+fn ready_carries_the_transaction_state() {
+    let server = Server::start();
+    let mut conn = server.connect();
+    conn.start_up();
+
+    assert_eq!(
+        state(&conn.run("CREATE TABLE item (id INTEGER PRIMARY KEY)")),
+        TxState::None
+    );
+    assert_eq!(state(&conn.run("BEGIN")), TxState::Open);
+    assert_eq!(
+        state(&conn.run("INSERT INTO item (id) VALUES (1)")),
+        TxState::Open
+    );
+    assert_eq!(state(&conn.run("COMMIT")), TxState::None);
+
+    assert_eq!(state(&conn.run("BEGIN READ ONLY")), TxState::ReadOnly);
+    assert_eq!(state(&conn.run("SELECT id FROM item")), TxState::ReadOnly);
+    // A refused change leaves the transaction as it was.
+    assert_eq!(
+        state(&conn.run("INSERT INTO item (id) VALUES (2)")),
+        TxState::ReadOnly
+    );
+    assert_eq!(state(&conn.run("ROLLBACK")), TxState::None);
+}

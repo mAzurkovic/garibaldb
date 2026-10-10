@@ -496,6 +496,8 @@ classDiagram
         NOT_NULL_VIOLATION
         STORAGE_FULL
         TXN_ABORTED
+        READ_ONLY_TXN
+        TXN_ALREADY_OPEN
         SCHEMA_CHANGE_IN_TXN
         LOCK_TIMEOUT
         TOO_MANY_CONNECTIONS

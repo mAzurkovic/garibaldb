@@ -8,11 +8,12 @@ use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use protocol::error::ErrorCode;
 use protocol::message::ServerMsg;
 
-use crate::catalog::registry::Registry;
+use crate::catalog::registry::{Limits, Registry};
 use crate::config::Config;
 use crate::net::cancel::CancelRegistry;
 use crate::net::session;
@@ -35,7 +36,15 @@ impl Server {
     /// Binds the port of the config. Port 0 takes any free port, which
     /// [`Server::local_addr`] then reports.
     pub fn bind(config: &Config) -> io::Result<Server> {
-        let databases = Registry::new(&config.data_dir, config.mem_limit, config.wal_max_bytes)?;
+        let databases = Registry::new(
+            &config.data_dir,
+            Limits {
+                memory: config.mem_limit,
+                wal: config.wal_max_bytes,
+                checkpoint: config.checkpoint_bytes,
+                lock_timeout: Duration::from_millis(config.lock_timeout_ms),
+            },
+        )?;
         databases.bootstrap()?;
         // Every log is read back before the listener accepts, so no client
         // ever sees a page that recovery is about to take away.

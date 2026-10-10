@@ -26,6 +26,27 @@ impl FrameIndex {
             .copied()
     }
 
+    /// Is the newest frame of a page at or past a mark?
+    ///
+    /// True means a reader at that mark cannot take the page from the buffer
+    /// pool, because the pool holds the newest form of it and the newest form
+    /// came after the mark.
+    pub fn newer_than(&self, table: u32, page_no: u32, mark: u64) -> bool {
+        self.frames
+            .get(&(table, page_no))
+            .and_then(|frames| frames.last())
+            .is_some_and(|at| *at >= mark)
+    }
+
+    /// Forgets every frame at or past a mark, which is what cutting the log
+    /// back to that mark leaves.
+    pub fn drop_from(&mut self, mark: u64) {
+        self.frames.retain(|_, frames| {
+            frames.retain(|at| *at < mark);
+            !frames.is_empty()
+        });
+    }
+
     /// Every page the log holds, with its newest frame.
     pub fn pages(&self) -> Vec<(u32, u32, u64)> {
         self.frames
@@ -60,6 +81,30 @@ mod tests {
         index.insert(1, 3, 200);
         assert_eq!(index.newest(1, 2, u64::MAX), Some(300));
         assert_eq!(index.newest(1, 3, u64::MAX), Some(200));
+    }
+
+    #[test]
+    fn a_frame_at_or_past_a_mark_is_newer_than_it() {
+        let mut index = FrameIndex::default();
+        index.insert(1, 2, 100);
+        assert!(index.newer_than(1, 2, 100), "at the mark is not before it");
+        assert!(index.newer_than(1, 2, 99));
+        assert!(!index.newer_than(1, 2, 101));
+        assert!(!index.newer_than(1, 3, 0), "a page the log holds not");
+    }
+
+    #[test]
+    fn dropping_from_a_mark_forgets_the_frames_at_or_past_it() {
+        let mut index = FrameIndex::default();
+        index.insert(1, 2, 100);
+        index.insert(1, 2, 300);
+        index.insert(1, 3, 300);
+
+        index.drop_from(300);
+
+        assert_eq!(index.newest(1, 2, u64::MAX), Some(100));
+        assert_eq!(index.newest(1, 3, u64::MAX), None, "its only frame is gone");
+        assert_eq!(index.pages(), vec![(1, 2, 100)]);
     }
 
     #[test]

@@ -1,10 +1,15 @@
 //! Running the statements that read and change rows.
 //!
-//! A write checks everything it can before it writes anything, because there
-//! is no log to undo with yet. A walk that changes rows re-seeks after each
-//! one, so it never leans on a cursor that its own write has moved.
+//! A write checks everything it can before it writes anything. A walk that
+//! changes rows re-seeks after each one, so it never leans on a cursor that
+//! its own write has moved.
+//!
+//! Every change runs inside a transaction: the one its connection opened, or
+//! one that lasts the statement. The write lock of the database is held for
+//! as long as that transaction, so two writers never overlap.
 
 use std::ops::Bound;
+use std::sync::Arc;
 
 use protocol::{DataType, DbError, ErrorCode, Value};
 
@@ -15,43 +20,224 @@ use crate::exec::{eval, planner};
 use crate::sql::ast::{Assignment, Expr, Selection, Statement};
 use crate::store::btree::BTree;
 use crate::store::page::FileId;
-use crate::store::pool::BufferPool;
+use crate::store::pool::{BufferPool, Mark};
 use crate::store::row::{self, Row};
+use crate::txn::manager::{Lease, Transaction, TxnKind};
 use crate::wal::checkpoint;
 
 /// What a statement did.
 pub enum Answer<'a> {
     /// Rows to write out, and the columns that name them.
-    Rows(Box<dyn Operator + 'a>),
+    Rows {
+        plan: Box<dyn Operator + 'a>,
+        /// The mark the rows are read at, held until the last one has gone
+        /// out so that a checkpoint cannot take away the frames they come
+        /// from partway through.
+        _snapshot: Option<Lease>,
+    },
     /// A statement that changed the schema or some rows.
     Changed { kind: &'static str, rows: u64 },
 }
 
-/// Runs one statement.
-///
-/// A statement that changed anything writes its pages before it answers.
-/// Every statement stands alone until milestone 10, so one that reported
-/// success has to have reached the file. Nothing here is atomic: the WAL in
-/// milestone 9 is what makes a half-written change impossible.
+/// What a statement needs: the write lock, or a mark to read at.
+enum Does {
+    /// A change to the schema, which no transaction may hold.
+    Schema,
+    Change,
+    Read,
+}
+
+/// How a transaction ends.
+#[derive(Clone, Copy)]
+enum Ending {
+    Commit,
+    Rollback,
+}
+
+/// Runs one statement, in the transaction its connection holds or in one of
+/// its own.
 pub fn run<'a>(
+    statement: &Statement,
+    db: &Arc<Database>,
+    registry: &'a Registry,
+    txn: &mut Option<Transaction>,
+) -> Result<Answer<'a>, DbError> {
+    match statement {
+        Statement::Begin { read_only } => begin(db, registry, txn, *read_only),
+        Statement::Commit => finish(db, registry, txn, Ending::Commit),
+        Statement::Rollback => finish(db, registry, txn, Ending::Rollback),
+        _ => match txn.as_mut() {
+            Some(open) => inside(statement, db, registry, open),
+            None => alone(statement, db, registry),
+        },
+    }
+}
+
+/// Opens a transaction. A connection holds one at a time, so a second
+/// `BEGIN` is refused rather than taken for the first one.
+fn begin<'a>(
+    db: &Arc<Database>,
+    registry: &Registry,
+    txn: &mut Option<Transaction>,
+    read_only: bool,
+) -> Result<Answer<'a>, DbError> {
+    if txn.is_some() {
+        return Err(named(
+            ErrorCode::TxnAlreadyOpen,
+            "this connection already holds a transaction",
+        ));
+    }
+    let kind = match read_only {
+        true => TxnKind::ReadOnly,
+        false => TxnKind::ReadWrite,
+    };
+    *txn = Some(db.begin(kind, registry.limits().lock_timeout)?);
+    Ok(Answer::Changed {
+        kind: "BEGIN",
+        rows: 0,
+    })
+}
+
+/// Ends the open transaction. A commit that fails rolls back instead, so the
+/// pages it did not settle never reach a later statement.
+fn finish<'a>(
+    db: &Arc<Database>,
+    registry: &Registry,
+    txn: &mut Option<Transaction>,
+    ending: Ending,
+) -> Result<Answer<'a>, DbError> {
+    let Some(open) = txn.take() else {
+        return Err(named(
+            ErrorCode::SyntaxError,
+            "no transaction is open on this connection",
+        ));
+    };
+    let pool = registry.pool();
+    let kind = match ending {
+        Ending::Commit => "COMMIT",
+        Ending::Rollback => "ROLLBACK",
+    };
+    match ending {
+        Ending::Rollback => open.rollback(pool, db)?,
+        // A statement of this transaction failed partway, so its changes are
+        // still in the pool and no one may add to them.
+        Ending::Commit if open.is_aborted() => {
+            open.rollback(pool, db)?;
+            return Err(aborted());
+        }
+        Ending::Commit => match open.commit(pool, db) {
+            // Still under the write lock, because the transaction holds it
+            // until it drops at the end of this call.
+            Ok(()) => settle(registry, db)?,
+            Err(e) => {
+                open.rollback(pool, db)?;
+                return Err(e);
+            }
+        },
+    }
+    Ok(Answer::Changed { kind, rows: 0 })
+}
+
+/// A statement inside an open transaction.
+fn inside<'a>(
     statement: &Statement,
     db: &Database,
     registry: &'a Registry,
+    open: &mut Transaction,
 ) -> Result<Answer<'a>, DbError> {
-    let answer = dispatch(statement, db, registry)?;
-    if let Answer::Changed { .. } = &answer {
-        registry.pool().commit(&db.wal)?;
-        if db.wal.end() > checkpoint::THRESHOLD {
-            checkpoint::run(registry.pool(), &db.wal)?;
+    if open.is_aborted() {
+        return Err(aborted());
+    }
+    match does(statement) {
+        Does::Schema => Err(named(
+            ErrorCode::SchemaChangeInTxn,
+            "a schema change cannot run inside a transaction",
+        )),
+        Does::Read => dispatch(statement, db, registry, open.mark(), None),
+        Does::Change => {
+            open.check_writable()?;
+            // A change that failed partway left pages in the pool that no
+            // commit may settle, so the transaction ends here and the client
+            // has to roll back.
+            dispatch(statement, db, registry, open.mark(), None).inspect_err(|_| open.abort())
         }
     }
-    Ok(answer)
 }
 
+/// A statement with no transaction around it, which is its own transaction.
+fn alone<'a>(
+    statement: &Statement,
+    db: &Arc<Database>,
+    registry: &'a Registry,
+) -> Result<Answer<'a>, DbError> {
+    match does(statement) {
+        // A schema change is written by an atomic rename, not through the
+        // log, so it takes no lock.
+        Does::Schema => dispatch(statement, db, registry, Mark::Latest, None),
+        Does::Change => {
+            let txn = db.begin(TxnKind::ReadWrite, registry.limits().lock_timeout)?;
+            let pool = registry.pool();
+            match dispatch(statement, db, registry, Mark::Latest, None) {
+                Ok(answer) => {
+                    txn.commit(pool, db)?;
+                    settle(registry, db)?;
+                    Ok(answer)
+                }
+                // Nothing of a failed statement stays behind, not even in
+                // the pool.
+                Err(e) => {
+                    txn.rollback(pool, db)?;
+                    Err(e)
+                }
+            }
+        }
+        Does::Read => {
+            let mark = db.wal.committed();
+            let lease = Some(db.readers.lease(mark));
+            dispatch(statement, db, registry, Mark::At(mark), lease)
+        }
+    }
+}
+
+/// What a statement needs of its database.
+fn does(statement: &Statement) -> Does {
+    match statement {
+        Statement::CreateDatabase { .. }
+        | Statement::DropDatabase { .. }
+        | Statement::CreateTable { .. }
+        | Statement::DropTable { .. } => Does::Schema,
+        Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } => {
+            Does::Change
+        }
+        // `BEGIN`, `COMMIT` and `ROLLBACK` never reach here.
+        _ => Does::Read,
+    }
+}
+
+/// Moves the log into the table files once it has grown enough. The caller
+/// holds the write lock, so nothing appends while the log is emptied.
+fn settle(registry: &Registry, db: &Database) -> Result<(), DbError> {
+    match checkpoint::due(&db.wal, &db.readers, registry.limits().checkpoint) {
+        true => checkpoint::run(registry.pool(), &db.wal),
+        false => Ok(()),
+    }
+}
+
+fn aborted() -> DbError {
+    named(
+        ErrorCode::TxnAborted,
+        "a statement of this transaction failed, so it has to be rolled back",
+    )
+}
+
+/// Runs the statement itself, at the mark its reads take. A read carries the
+/// lease of that mark out with its rows.
 fn dispatch<'a>(
     statement: &Statement,
     db: &Database,
     registry: &'a Registry,
+    mark: Mark,
+    lease: Option<Lease>,
 ) -> Result<Answer<'a>, DbError> {
     match statement {
         Statement::CreateDatabase { name } => {
@@ -103,7 +289,19 @@ fn dispatch<'a>(
                     "ORDER BY is not supported yet",
                 ));
             }
-            select(db, registry, table, selection, filter.as_ref(), *limit).map(Answer::Rows)
+            select(
+                db,
+                registry,
+                table,
+                selection,
+                filter.as_ref(),
+                *limit,
+                mark,
+            )
+            .map(|plan| Answer::Rows {
+                plan,
+                _snapshot: lease,
+            })
         }
         Statement::Update {
             table,
@@ -117,11 +315,11 @@ fn dispatch<'a>(
             kind: "DELETE",
             rows: delete(db, registry, table, filter.as_ref())?,
         }),
-        // A transaction is milestone 10's. Refusing BEGIN is what keeps a
-        // client from believing it holds one.
+        // `run` answers these, because they change what the connection
+        // holds and not what a database holds.
         Statement::Begin { .. } | Statement::Commit | Statement::Rollback => Err(named(
-            ErrorCode::TxnAborted,
-            "the server holds no transaction yet",
+            ErrorCode::SyntaxError,
+            "a transaction statement runs on the connection",
         )),
     }
 }
@@ -163,7 +361,7 @@ fn insert(
     // A key has to be new to the table and to the other rows of this
     // statement. The list is one statement long, so the scan over it is
     // short; a statement of many thousands of rows would want a set.
-    let tree = BTree::open(pool, file, &table);
+    let tree = BTree::open(pool, file, &table, Mark::Latest);
     let mut keys: Vec<Value> = Vec::with_capacity(rows.len());
     for row in &rows {
         let key = &row[table.pk_index];
@@ -189,10 +387,19 @@ fn select<'a>(
     selection: &Selection,
     condition: Option<&Expr>,
     limit: Option<u64>,
+    mark: Mark,
 ) -> Result<Box<dyn Operator + 'a>, DbError> {
     let table = table_of(db, name)?;
     let file = registry.table_file(db, &table)?;
-    planner::plan(&table, selection, condition, limit, registry.pool(), file)
+    planner::plan(
+        &table,
+        selection,
+        condition,
+        limit,
+        registry.pool(),
+        file,
+        mark,
+    )
 }
 
 /// Changes every row the condition takes.
@@ -206,7 +413,7 @@ fn update(
     let table = table_of(db, name)?;
     let file = registry.table_file(db, &table)?;
     let pool = registry.pool();
-    let tree = BTree::open(pool, file, &table);
+    let tree = BTree::open(pool, file, &table, Mark::Latest);
 
     // Every value assigned is a literal, so its type is checked once here
     // rather than once for each row. A row that was good stays good.
@@ -248,7 +455,7 @@ fn delete(
     let table = table_of(db, name)?;
     let file = registry.table_file(db, &table)?;
     let pool = registry.pool();
-    let tree = BTree::open(pool, file, &table);
+    let tree = BTree::open(pool, file, &table, Mark::Latest);
 
     let mut gone = 0;
     let mut last = None;
@@ -403,9 +610,9 @@ mod tests {
     /// Runs a statement and returns its rows, which a write leaves empty.
     fn rows(sql: &str, held: &Connected, registry: &Registry) -> Result<Vec<Row>, DbError> {
         let statement = parser::parse(sql).expect("the statement parses");
-        match run(&statement, &held.db, registry)? {
+        match run(&statement, &held.db, registry, &mut None)? {
             Answer::Changed { .. } => Ok(Vec::new()),
-            Answer::Rows(mut plan) => {
+            Answer::Rows { mut plan, .. } => {
                 let mut found = Vec::new();
                 while let Some(row) = plan.next()? {
                     found.push(row);
@@ -415,12 +622,29 @@ mod tests {
         }
     }
 
-    /// Runs a statement and returns how many rows it changed.
+    /// Runs a statement and returns how many rows it changed, or how many it
+    /// read.
     fn changed(sql: &str, held: &Connected, registry: &Registry) -> Result<u64, DbError> {
+        on(sql, held, registry, &mut None)
+    }
+
+    /// Runs a statement on a connection that may hold a transaction.
+    fn on(
+        sql: &str,
+        held: &Connected,
+        registry: &Registry,
+        txn: &mut Option<Transaction>,
+    ) -> Result<u64, DbError> {
         let statement = parser::parse(sql).expect("the statement parses");
-        match run(&statement, &held.db, registry)? {
+        match run(&statement, &held.db, registry, txn)? {
             Answer::Changed { rows, .. } => Ok(rows),
-            Answer::Rows(_) => panic!("{sql} reads rows"),
+            Answer::Rows { mut plan, .. } => {
+                let mut rows = 0;
+                while plan.next()?.is_some() {
+                    rows += 1;
+                }
+                Ok(rows)
+            }
         }
     }
 
@@ -464,7 +688,8 @@ mod tests {
             ("DROP TABLE t", "DROP TABLE"),
         ] {
             let statement = parser::parse(sql).unwrap();
-            let Answer::Changed { kind: got, rows } = run(&statement, &held.db, &registry).unwrap()
+            let Answer::Changed { kind: got, rows } =
+                run(&statement, &held.db, &registry, &mut None).unwrap()
             else {
                 panic!("{sql} reads rows");
             };
@@ -804,14 +1029,249 @@ mod tests {
         assert!(e.message.contains("not supported yet"), "{e}");
     }
 
+    /// A database whose log takes every write and settles none of them,
+    /// which is a disk that has gone away under the server.
+    fn unsettling(label: &str) -> (Dir, std::sync::Arc<Registry>, Connected) {
+        let dir = Dir::new(label);
+        let registry = dir.registry();
+        registry.create("shop").expect("the database is new");
+        let wal = dir.0.join("shop").join("wal");
+        std::fs::create_dir_all(&wal).expect("the log directory is made");
+        std::os::unix::fs::symlink("/dev/null", wal.join("000.wal")).expect("the device links");
+        let held = Registry::connect(&registry, "shop").expect("the database opens");
+        (dir, registry, held)
+    }
+
     #[test]
-    fn a_transaction_statement_is_refused() {
-        let (_dir, registry, held) = shop("transactions");
+    fn a_commit_that_cannot_settle_keeps_nothing_and_still_reads() {
+        let (_dir, registry, held) = unsettling("commit-fails");
+        item(&held, &registry);
+
+        let mut txn = None;
+        on("BEGIN", &held, &registry, &mut txn).unwrap();
+        on(
+            "INSERT INTO item (id, label) VALUES (1, 'a')",
+            &held,
+            &registry,
+            &mut txn,
+        )
+        .unwrap();
+        let e = on("COMMIT", &held, &registry, &mut txn).err().unwrap();
+        assert_eq!(e.code, ErrorCode::StorageFull);
+
+        assert!(txn.is_none(), "the transaction is over either way");
+        // Reads carry on after a write is refused, and the row is not there.
+        assert_eq!(
+            shown("SELECT id FROM item", &held, &registry),
+            [] as [String; 0]
+        );
+    }
+
+    #[test]
+    fn a_transaction_statement_never_reaches_the_dispatcher() {
+        let (_dir, registry, held) = shop("dispatch-guard");
         for sql in ["BEGIN", "BEGIN READ ONLY", "COMMIT", "ROLLBACK"] {
-            let e = changed(sql, &held, &registry).err().unwrap();
-            assert_eq!(e.code, ErrorCode::TxnAborted, "{sql}");
-            assert!(e.message.contains("no transaction yet"), "{e}");
+            let statement = parser::parse(sql).unwrap();
+            let e = dispatch(&statement, &held.db, &registry, Mark::Latest, None)
+                .err()
+                .unwrap();
+            assert_eq!(e.code, ErrorCode::SyntaxError, "{sql}");
+            assert!(e.message.contains("runs on the connection"), "{e}");
         }
+    }
+
+    #[test]
+    fn a_second_begin_on_one_connection_is_refused() {
+        let (_dir, registry, held) = shop("second-begin");
+        let mut txn = None;
+        on("BEGIN", &held, &registry, &mut txn).unwrap();
+
+        for sql in ["BEGIN", "BEGIN READ ONLY"] {
+            let e = on(sql, &held, &registry, &mut txn).err().unwrap();
+            assert_eq!(e.code, ErrorCode::TxnAlreadyOpen, "{sql}");
+            assert!(e.message.contains("already holds"), "{e}");
+        }
+        assert!(txn.is_some(), "the transaction it held is still open");
+    }
+
+    #[test]
+    fn an_end_with_no_transaction_open_is_refused() {
+        let (_dir, registry, held) = shop("no-transaction");
+        for sql in ["COMMIT", "ROLLBACK"] {
+            let e = on(sql, &held, &registry, &mut None).err().unwrap();
+            assert_eq!(e.code, ErrorCode::SyntaxError, "{sql}");
+            assert!(e.message.contains("no transaction is open"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_transaction_keeps_its_rows_only_once_it_commits() {
+        let (_dir, registry, held) = shop("commit-keeps");
+        item(&held, &registry);
+        let mut txn = None;
+        on("BEGIN", &held, &registry, &mut txn).unwrap();
+        on(
+            "INSERT INTO item (id, label) VALUES (1, 'a')",
+            &held,
+            &registry,
+            &mut txn,
+        )
+        .unwrap();
+        // Its own changes are there for it to read.
+        assert_eq!(
+            on("SELECT * FROM item", &held, &registry, &mut txn).unwrap(),
+            1
+        );
+        on("COMMIT", &held, &registry, &mut txn).unwrap();
+
+        assert!(txn.is_none(), "the transaction ended");
+        assert_eq!(shown("SELECT id FROM item", &held, &registry), ["1"]);
+    }
+
+    #[test]
+    fn a_transaction_that_rolls_back_keeps_nothing() {
+        let (_dir, registry, held) = shop("rollback-keeps-nothing");
+        item(&held, &registry);
+        changed(
+            "INSERT INTO item (id, label) VALUES (1, 'a')",
+            &held,
+            &registry,
+        )
+        .unwrap();
+
+        let mut txn = None;
+        on("BEGIN", &held, &registry, &mut txn).unwrap();
+        on(
+            "INSERT INTO item (id, label) VALUES (2, 'b')",
+            &held,
+            &registry,
+            &mut txn,
+        )
+        .unwrap();
+        on("UPDATE item SET label = 'z'", &held, &registry, &mut txn).unwrap();
+        on("ROLLBACK", &held, &registry, &mut txn).unwrap();
+
+        assert!(txn.is_none());
+        assert_eq!(
+            shown("SELECT id, label FROM item", &held, &registry),
+            ["1 a"]
+        );
+    }
+
+    #[test]
+    fn a_read_only_transaction_refuses_every_change() {
+        let (_dir, registry, held) = shop("read-only-refuses");
+        item(&held, &registry);
+        let mut txn = None;
+        on("BEGIN READ ONLY", &held, &registry, &mut txn).unwrap();
+
+        for sql in [
+            "INSERT INTO item (id, label) VALUES (1, 'a')",
+            "UPDATE item SET label = 'b'",
+            "DELETE FROM item",
+        ] {
+            let e = on(sql, &held, &registry, &mut txn).err().unwrap();
+            assert_eq!(e.code, ErrorCode::ReadOnlyTxn, "{sql}");
+        }
+        // It still reads.
+        on("SELECT * FROM item", &held, &registry, &mut txn).unwrap();
+    }
+
+    #[test]
+    fn a_schema_change_inside_a_transaction_is_refused() {
+        let (_dir, registry, held) = shop("ddl-in-transaction");
+        for read_only in ["BEGIN", "BEGIN READ ONLY"] {
+            let mut txn = None;
+            on(read_only, &held, &registry, &mut txn).unwrap();
+            for sql in [
+                "CREATE TABLE t (a INTEGER PRIMARY KEY)",
+                "DROP TABLE item",
+                "CREATE DATABASE other",
+                "DROP DATABASE other",
+            ] {
+                let e = on(sql, &held, &registry, &mut txn).err().unwrap();
+                assert_eq!(e.code, ErrorCode::SchemaChangeInTxn, "{sql}");
+            }
+            on("ROLLBACK", &held, &registry, &mut txn).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_statement_that_failed_partway_ends_its_transaction() {
+        let (_dir, registry, held) = shop("aborted");
+        item(&held, &registry);
+        for id in 1..=2 {
+            changed(
+                &format!("INSERT INTO item (id, label) VALUES ({id}, 'a')"),
+                &held,
+                &registry,
+            )
+            .unwrap();
+        }
+
+        let mut txn = None;
+        on("BEGIN", &held, &registry, &mut txn).unwrap();
+        // The first row takes the key, the second one collides with it.
+        let e = on("UPDATE item SET id = 7", &held, &registry, &mut txn)
+            .err()
+            .unwrap();
+        assert_eq!(e.code, ErrorCode::DuplicateKey);
+
+        let e = on("SELECT * FROM item", &held, &registry, &mut txn)
+            .err()
+            .unwrap();
+        assert_eq!(e.code, ErrorCode::TxnAborted);
+        let e = on("COMMIT", &held, &registry, &mut txn).err().unwrap();
+        assert_eq!(e.code, ErrorCode::TxnAborted);
+
+        assert!(txn.is_none(), "the commit ended it");
+        assert_eq!(
+            shown("SELECT id FROM item", &held, &registry),
+            ["1", "2"],
+            "the half-finished change is gone"
+        );
+    }
+
+    #[test]
+    fn a_failed_statement_of_its_own_changes_nothing() {
+        let (_dir, registry, held) = shop("failed-alone");
+        item(&held, &registry);
+        for id in 1..=2 {
+            changed(
+                &format!("INSERT INTO item (id, label) VALUES ({id}, 'a')"),
+                &held,
+                &registry,
+            )
+            .unwrap();
+        }
+
+        let e = changed("UPDATE item SET id = 7", &held, &registry)
+            .err()
+            .unwrap();
+        assert_eq!(e.code, ErrorCode::DuplicateKey);
+        assert_eq!(shown("SELECT id FROM item", &held, &registry), ["1", "2"]);
+    }
+
+    #[test]
+    fn a_reader_outside_a_transaction_holds_a_mark_while_its_rows_flow() {
+        let (_dir, registry, held) = shop("reader-lease");
+        item(&held, &registry);
+        changed(
+            "INSERT INTO item (id, label) VALUES (1, 'a')",
+            &held,
+            &registry,
+        )
+        .unwrap();
+
+        let statement = parser::parse("SELECT * FROM item").unwrap();
+        let answer = run(&statement, &held.db, &registry, &mut None).unwrap();
+        assert_eq!(
+            held.db.readers.oldest(),
+            Some(held.db.wal.committed()),
+            "the rows have not gone out yet"
+        );
+        drop(answer);
+        assert_eq!(held.db.readers.oldest(), None);
     }
 
     #[test]
@@ -819,14 +1279,16 @@ mod tests {
         let (_dir, registry, held) = shop("schema");
         item(&held, &registry);
         let statement = parser::parse("SELECT label, id FROM item").unwrap();
-        let Answer::Rows(plan) = run(&statement, &held.db, &registry).unwrap() else {
+        let Answer::Rows { plan, .. } = run(&statement, &held.db, &registry, &mut None).unwrap()
+        else {
             panic!("expected rows");
         };
         let names: Vec<&str> = plan.schema().iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["label", "id"]);
 
         let statement = parser::parse("SELECT * FROM item").unwrap();
-        let Answer::Rows(plan) = run(&statement, &held.db, &registry).unwrap() else {
+        let Answer::Rows { plan, .. } = run(&statement, &held.db, &registry, &mut None).unwrap()
+        else {
             panic!("expected rows");
         };
         let names: Vec<&str> = plan.schema().iter().map(|c| c.name.as_str()).collect();
@@ -873,8 +1335,11 @@ mod tests {
     fn the_log_keeps_what_came_before_and_is_not_emptied_by_each_statement() {
         let (_dir, registry, held) = shop("log-growth");
         item(&held, &registry);
-        let after_create = held.db.wal.end();
-        assert!(after_create > 0, "the table reached the log");
+        assert_eq!(
+            held.db.wal.end(),
+            0,
+            "a schema change is written by a rename, not through the log"
+        );
 
         changed(
             "INSERT INTO item (id, label) VALUES (1, 'a')",
@@ -882,9 +1347,49 @@ mod tests {
             &registry,
         )
         .unwrap();
+        let after_insert = held.db.wal.end();
+        assert!(after_insert > 0, "the rows reached the log");
+
+        changed(
+            "INSERT INTO item (id, label) VALUES (2, 'b')",
+            &held,
+            &registry,
+        )
+        .unwrap();
         assert!(
-            held.db.wal.end() > after_create,
+            held.db.wal.end() > after_insert,
             "a checkpoint runs on size, not on every statement"
+        );
+    }
+
+    #[test]
+    fn a_log_past_its_threshold_is_checkpointed_and_the_rows_do_not_change() {
+        let (_dir, registry, held) = shop("checkpoint-on-size");
+        item(&held, &registry);
+        let threshold = registry.limits().checkpoint;
+
+        // Each statement appends the page it changed, so a hundred of them
+        // pass the threshold several times over. A checkpoint runs at the end
+        // of the statement that passes it, so the log is never seen above it.
+        const ROWS: u64 = 100;
+        for id in 1..=ROWS {
+            changed(
+                &format!("INSERT INTO item (id, label) VALUES ({id}, 'a')"),
+                &held,
+                &registry,
+            )
+            .unwrap();
+        }
+
+        assert!(
+            held.db.wal.end() <= threshold,
+            "the log grew to {} with a threshold of {threshold}",
+            held.db.wal.end()
+        );
+        // The pages went to their table file, not away.
+        assert_eq!(
+            shown("SELECT id FROM item", &held, &registry).len(),
+            ROWS as usize
         );
     }
 

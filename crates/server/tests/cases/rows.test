@@ -1,5 +1,5 @@
-# Rows go in, come back, change, and go. Every statement runs on its own,
-# because a transaction is not here yet.
+# Rows go in, come back, change, and go. Every statement here runs on its
+# own, which is a transaction of one statement.
 
 statement ok
 CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL, sold BOOLEAN, price DECIMAL(10, 2))

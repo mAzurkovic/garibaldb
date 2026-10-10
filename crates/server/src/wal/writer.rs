@@ -153,6 +153,10 @@ fn read_at(file: &File, into: &mut [u8], at: u64) -> Result<(), DbError> {
 /// bytes of a frame.
 struct State {
     end: u64,
+    /// Where the log stood after the last commit frame. A reader takes this
+    /// and not `end`, because an eviction appends a page frame that no one
+    /// has committed and raises `end`.
+    commit_end: u64,
     next_lsn: u64,
     index: FrameIndex,
     /// A sync that failed. Nothing may commit after one, because nothing
@@ -194,6 +198,7 @@ impl Wal {
             limit,
             state: Mutex::new(State {
                 end: recovered.end,
+                commit_end: recovered.end,
                 next_lsn: recovered.next_lsn,
                 index: recovered.index,
                 broken: false,
@@ -252,6 +257,7 @@ impl Wal {
             return Err(storage_error(format!("the log did not sync: {e}")));
         }
         state.end = at + len;
+        state.commit_end = state.end;
         state.next_lsn += 1;
         Ok(())
     }
@@ -279,10 +285,21 @@ impl Wal {
         }
     }
 
-    /// Where the next frame goes, which is also how long the log is and the
-    /// mark a reader takes.
+    /// Where the next frame goes, which is also how long the log is.
     pub fn end(&self) -> u64 {
         self.state.lock().expect("the log lock holds").end
+    }
+
+    /// The mark a reader takes: everything committed is below it, and
+    /// everything above it is a change no one has committed.
+    pub fn committed(&self) -> u64 {
+        self.state.lock().expect("the log lock holds").commit_end
+    }
+
+    /// Has a page changed at or past a mark?
+    pub fn changed_since(&self, table: u32, page_no: u32, mark: u64) -> bool {
+        let state = self.state.lock().expect("the log lock holds");
+        state.index.newer_than(table, page_no, mark)
     }
 
     /// Every page the log holds, with the frame that holds it.
@@ -307,7 +324,24 @@ impl Wal {
             .set_len(0)
             .map_err(|e| storage_error(format!("the log did not empty: {e}")))?;
         state.end = 0;
+        state.commit_end = 0;
         state.index.clear();
+        Ok(())
+    }
+
+    /// Cuts the log back to a mark, which is how a transaction that keeps
+    /// nothing leaves no trace. Only frames above the last commit are ever
+    /// cut, so `commit_end` stays where it is.
+    pub fn truncate_to(&self, mark: u64) -> Result<(), DbError> {
+        let mut state = self.state.lock().expect("the log lock holds");
+        if mark >= state.end {
+            return Ok(());
+        }
+        self.file
+            .set_len(mark)
+            .map_err(|e| storage_error(format!("the log did not shorten: {e}")))?;
+        state.end = mark;
+        state.index.drop_from(mark);
         Ok(())
     }
 }
@@ -476,6 +510,61 @@ mod tests {
             e.message.contains("no page where its index says one"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn the_mark_a_reader_takes_sits_past_the_last_commit() {
+        let (_dir, wal) = log("mark");
+        assert_eq!(wal.committed(), 0);
+
+        wal.append_page(1, 1, &page(1)).unwrap();
+        assert!(wal.end() > 0);
+        assert_eq!(wal.committed(), 0, "no one committed that page");
+
+        wal.commit().unwrap();
+        assert_eq!(wal.committed(), wal.end());
+
+        wal.append_page(1, 1, &page(2)).unwrap();
+        assert!(
+            wal.end() > wal.committed(),
+            "the log grew past what committed"
+        );
+    }
+
+    #[test]
+    fn a_log_cut_back_to_a_mark_forgets_what_came_after() {
+        let (_dir, wal) = log("cut-back");
+        wal.append_page(1, 1, &page(1)).unwrap();
+        wal.commit().unwrap();
+        let mark = wal.end();
+        wal.append_page(1, 1, &page(2)).unwrap();
+        wal.append_page(1, 2, &page(2)).unwrap();
+
+        wal.truncate_to(mark).unwrap();
+
+        assert_eq!(wal.end(), mark);
+        assert_eq!(wal.committed(), mark, "the commit is still a commit");
+        assert_eq!(mark_of(&wal.read_page(1, 1, mark).unwrap().unwrap()), 1);
+        assert_eq!(
+            wal.read_page(1, 2, mark).unwrap(),
+            None,
+            "its frame is gone"
+        );
+        assert!(!wal.changed_since(1, 1, mark));
+    }
+
+    #[test]
+    fn a_cut_to_a_mark_at_the_end_or_past_it_leaves_the_log_alone() {
+        let (_dir, wal) = log("cut-nothing");
+        wal.append_page(1, 1, &page(1)).unwrap();
+        wal.commit().unwrap();
+        let end = wal.end();
+
+        wal.truncate_to(end).unwrap();
+        wal.truncate_to(end + 1).unwrap();
+
+        assert_eq!(wal.end(), end);
+        assert!(wal.changed_since(1, 1, 0));
     }
 
     #[test]

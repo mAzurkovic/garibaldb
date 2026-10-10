@@ -1,0 +1,182 @@
+# Transactions on one connection: all of a transaction's changes or none.
+
+statement ok
+CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL)
+
+statement ok
+INSERT INTO item (id, label) VALUES (1, 'apple')
+
+# A transaction that commits keeps every change it made.
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO item (id, label) VALUES (2, 'pear')
+
+statement ok
+UPDATE item SET label = 'cider' WHERE id = 1
+
+# Its own changes are there for it to read before it commits.
+
+query
+SELECT id, label FROM item
+----
+1 | cider
+2 | pear
+(2 rows)
+
+statement ok
+COMMIT
+
+query
+SELECT id, label FROM item
+----
+1 | cider
+2 | pear
+(2 rows)
+
+# A transaction that rolls back keeps none of them.
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO item (id, label) VALUES (3, 'plum')
+
+statement ok
+DELETE FROM item WHERE id = 1
+
+query
+SELECT id FROM item
+----
+2
+3
+(2 rows)
+
+statement ok
+ROLLBACK
+
+query
+SELECT id, label FROM item
+----
+1 | cider
+2 | pear
+(2 rows)
+
+# A transaction that only reads refuses every change, and still reads.
+
+statement ok
+BEGIN READ ONLY
+
+statement error READ_ONLY_TXN
+INSERT INTO item (id, label) VALUES (4, 'fig')
+
+statement error READ_ONLY_TXN
+UPDATE item SET label = 'fig'
+
+statement error READ_ONLY_TXN
+DELETE FROM item
+
+query
+SELECT id FROM item
+----
+1
+2
+(2 rows)
+
+statement ok
+COMMIT
+
+# One transaction at a time on a connection.
+
+statement ok
+BEGIN
+
+statement error TXN_ALREADY_OPEN
+BEGIN
+
+statement error TXN_ALREADY_OPEN
+BEGIN READ ONLY
+
+# A schema change never runs inside a transaction.
+
+statement error SCHEMA_CHANGE_IN_TXN
+CREATE TABLE other (a INTEGER PRIMARY KEY)
+
+statement error SCHEMA_CHANGE_IN_TXN
+DROP TABLE item
+
+statement error SCHEMA_CHANGE_IN_TXN
+CREATE DATABASE other
+
+statement error SCHEMA_CHANGE_IN_TXN
+DROP DATABASE other
+
+statement ok
+ROLLBACK
+
+# Ending a transaction that was never begun.
+
+statement error SYNTAX_ERROR
+COMMIT
+
+statement error SYNTAX_ERROR
+ROLLBACK
+
+# A statement that failed ends its transaction, because a statement cannot be
+# undone by halves. Nothing it changed survives.
+
+statement ok
+BEGIN
+
+statement error DUPLICATE_KEY
+UPDATE item SET id = 9
+
+statement error TXN_ABORTED
+SELECT id FROM item
+
+statement error TXN_ABORTED
+INSERT INTO item (id, label) VALUES (5, 'sloe')
+
+statement ok
+ROLLBACK
+
+query
+SELECT id, label FROM item
+----
+1 | cider
+2 | pear
+(2 rows)
+
+# A row that breaks a rule of its table ends it the same way. The next
+# transaction carries on.
+
+statement ok
+BEGIN
+
+statement error NOT_NULL_VIOLATION
+INSERT INTO item (id) VALUES (6)
+
+statement error TXN_ABORTED
+INSERT INTO item (id, label) VALUES (6, 'quince')
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO item (id, label) VALUES (6, 'quince')
+
+statement ok
+COMMIT
+
+query
+SELECT id FROM item
+----
+1
+2
+6
+(3 rows)

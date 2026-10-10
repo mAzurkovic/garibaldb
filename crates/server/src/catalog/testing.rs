@@ -3,8 +3,9 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::catalog::registry::{Connected, Registry};
+use crate::catalog::registry::{Connected, Limits, Registry};
 use crate::store::page::FileId;
 use crate::store::pool::BufferPool;
 use crate::wal::writer::Wal;
@@ -29,8 +30,18 @@ impl Dir {
         // A pool of a few hundred frames, which is plenty for a test and
         // keeps every one of them cheap to build.
         Arc::new(
-            Registry::new(&self.0, 4 * 1024 * 1024, 64 * 1024 * 1024)
-                .expect("the data directory opens"),
+            Registry::new(
+                &self.0,
+                Limits {
+                    memory: 4 * 1024 * 1024,
+                    wal: 64 * 1024 * 1024,
+                    // Small enough that a test can cross it in a handful of
+                    // statements, which is the only way to see a checkpoint.
+                    checkpoint: 256 * 1024,
+                    lock_timeout: Duration::from_secs(5),
+                },
+            )
+            .expect("the data directory opens"),
         )
     }
 

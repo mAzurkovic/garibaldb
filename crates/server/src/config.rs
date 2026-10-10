@@ -13,6 +13,11 @@ const DEFAULT_MEM_LIMIT: u64 = GIB;
 /// The WAL size that the memory budget in `design.md` assumes.
 const DEFAULT_WAL_MAX_BYTES: u64 = 8 * GIB;
 
+/// How large the log grows before a checkpoint empties it into the table
+/// files. One checkpoint copies this much, so it is a bound on how long a
+/// statement can be held up by one.
+const DEFAULT_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// The connection count that [NFR14] asks for.
 const DEFAULT_MAX_CONNECTIONS: usize = 100;
 
@@ -24,8 +29,11 @@ pub struct Config {
     pub port: u16,
     /// The memory limit in bytes. See [NFR10].
     pub mem_limit: u64,
-    /// The WAL size in bytes at which a checkpoint runs.
+    /// The WAL size in bytes at which a write is refused.
     pub wal_max_bytes: u64,
+    /// The WAL size in bytes at which a checkpoint empties it into the table
+    /// files.
+    pub checkpoint_bytes: u64,
     /// The wait in milliseconds after which a lock fails with `LOCK_TIMEOUT`.
     pub lock_timeout_ms: u64,
     /// The connection count that the server accepts. See [NFR14].
@@ -39,6 +47,7 @@ impl Default for Config {
             port: 5432,
             mem_limit: DEFAULT_MEM_LIMIT,
             wal_max_bytes: DEFAULT_WAL_MAX_BYTES,
+            checkpoint_bytes: DEFAULT_CHECKPOINT_BYTES,
             lock_timeout_ms: 5000,
             max_connections: DEFAULT_MAX_CONNECTIONS,
         }
@@ -61,6 +70,8 @@ impl Config {
                 "--data-dir" => config.data_dir = PathBuf::from(value(&flag, flags.next())?),
                 "--port" => config.port = number(&flag, flags.next())?,
                 "--max-connections" => config.max_connections = number(&flag, flags.next())?,
+                "--lock-timeout-ms" => config.lock_timeout_ms = number(&flag, flags.next())?,
+                "--checkpoint-bytes" => config.checkpoint_bytes = number(&flag, flags.next())?,
                 _ => return Err(format!("unknown flag `{flag}`")),
             }
         }
@@ -93,6 +104,7 @@ mod tests {
         assert_eq!(c.port, 5432);
         assert_eq!(c.mem_limit, 1024 * 1024 * 1024);
         assert_eq!(c.wal_max_bytes, 8 * 1024 * 1024 * 1024);
+        assert_eq!(c.checkpoint_bytes, 64 * 1024 * 1024);
         assert_eq!(c.lock_timeout_ms, 5000);
         assert_eq!(c.max_connections, 100);
     }
@@ -134,12 +146,36 @@ mod tests {
             "/tmp/db",
             "--max-connections",
             "7",
+            "--lock-timeout-ms",
+            "250",
         ])
         .unwrap();
         assert_eq!(
-            (c.port, c.data_dir, c.max_connections),
-            (6000, PathBuf::from("/tmp/db"), 7)
+            (c.port, c.data_dir, c.max_connections, c.lock_timeout_ms),
+            (6000, PathBuf::from("/tmp/db"), 7, 250)
         );
+    }
+
+    #[test]
+    fn the_checkpoint_size_takes_the_next_argument() {
+        assert_eq!(
+            parse(&["--checkpoint-bytes", "262144"])
+                .unwrap()
+                .checkpoint_bytes,
+            262144
+        );
+        assert!(parse(&["--checkpoint-bytes", "soon"]).is_err());
+    }
+
+    #[test]
+    fn the_lock_timeout_takes_the_next_argument() {
+        assert_eq!(
+            parse(&["--lock-timeout-ms", "250"])
+                .unwrap()
+                .lock_timeout_ms,
+            250
+        );
+        assert!(parse(&["--lock-timeout-ms", "soon"]).is_err());
     }
 
     #[test]

@@ -8,12 +8,14 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use protocol::{DbError, ErrorCode};
 
 use crate::catalog::{Catalog, Database, TableDef, named};
 use crate::store::page::FileId;
 use crate::store::pool::BufferPool;
+use crate::txn::lock::WriteLock;
 use crate::wal::writer::Wal;
 
 /// The database a new data directory gets. A client must name a database to
@@ -31,31 +33,48 @@ struct State {
 }
 
 /// Every database of one server.
+/// What the server lets a database use. One struct, because four numbers in a
+/// row at a call site say nothing about which is which.
+#[derive(Clone, Copy)]
+pub struct Limits {
+    /// The memory of the whole server, which sizes the one pool.
+    pub memory: u64,
+    /// How large the log of a database may grow before a write is refused.
+    pub wal: u64,
+    /// How large it grows before a checkpoint empties it into the files.
+    pub checkpoint: u64,
+    /// How long a write waits for the lock of its database.
+    pub lock_timeout: Duration,
+}
+
 pub struct Registry {
     data_dir: PathBuf,
     state: Mutex<State>,
     /// One pool for the whole server, because the memory limit is for the
     /// whole server.
     pool: BufferPool,
-    /// How large the log of a database may grow.
-    wal_limit: u64,
+    limits: Limits,
 }
 
 impl Registry {
     /// Opens the data directory, making it when it is not there yet. The
     /// memory limit sizes the one pool that every database reads through.
-    pub fn new(data_dir: &Path, mem_limit: u64, wal_limit: u64) -> io::Result<Registry> {
+    pub fn new(data_dir: &Path, limits: Limits) -> io::Result<Registry> {
         fs::create_dir_all(data_dir)?;
         Ok(Registry {
             data_dir: data_dir.to_path_buf(),
             state: Mutex::new(State::default()),
-            pool: BufferPool::new(mem_limit),
-            wal_limit,
+            pool: BufferPool::new(limits.memory),
+            limits,
         })
     }
 
     pub fn pool(&self) -> &BufferPool {
         &self.pool
+    }
+
+    pub fn limits(&self) -> Limits {
+        self.limits
     }
 
     /// The file that holds the rows of a table. The pool hands out the same
@@ -97,7 +116,9 @@ impl Registry {
         let db = Arc::new(Database {
             name: name.to_string(),
             catalog: Mutex::new(catalog),
-            wal: Arc::new(Wal::open(&dir, self.wal_limit)?),
+            wal: Arc::new(Wal::open(&dir, self.limits.wal)?),
+            lock: WriteLock::default(),
+            readers: Arc::default(),
         });
         state.open.insert(name.to_string(), Arc::clone(&db));
         Ok(db)

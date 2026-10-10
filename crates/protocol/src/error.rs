@@ -19,6 +19,10 @@ pub enum ErrorCode {
     NotNullViolation,
     StorageFull,
     TxnAborted,
+    /// A change asked for by a transaction that said it only reads.
+    ReadOnlyTxn,
+    /// A `BEGIN` on a connection that already holds a transaction.
+    TxnAlreadyOpen,
     SchemaChangeInTxn,
     LockTimeout,
     TooManyConnections,
@@ -31,7 +35,7 @@ pub enum ErrorCode {
 impl ErrorCode {
     /// Every code. A name reads back through this, so a new code needs no
     /// second table anywhere.
-    pub const ALL: [ErrorCode; 15] = [
+    pub const ALL: [ErrorCode; 17] = [
         ErrorCode::SyntaxError,
         ErrorCode::UnknownTable,
         ErrorCode::UnknownColumn,
@@ -40,6 +44,8 @@ impl ErrorCode {
         ErrorCode::NotNullViolation,
         ErrorCode::StorageFull,
         ErrorCode::TxnAborted,
+        ErrorCode::ReadOnlyTxn,
+        ErrorCode::TxnAlreadyOpen,
         ErrorCode::SchemaChangeInTxn,
         ErrorCode::LockTimeout,
         ErrorCode::TooManyConnections,
@@ -60,6 +66,8 @@ impl ErrorCode {
             ErrorCode::NotNullViolation => "NOT_NULL_VIOLATION",
             ErrorCode::StorageFull => "STORAGE_FULL",
             ErrorCode::TxnAborted => "TXN_ABORTED",
+            ErrorCode::ReadOnlyTxn => "READ_ONLY_TXN",
+            ErrorCode::TxnAlreadyOpen => "TXN_ALREADY_OPEN",
             ErrorCode::SchemaChangeInTxn => "SCHEMA_CHANGE_IN_TXN",
             ErrorCode::LockTimeout => "LOCK_TIMEOUT",
             ErrorCode::TooManyConnections => "TOO_MANY_CONNECTIONS",
@@ -115,7 +123,7 @@ impl std::error::Error for DbError {}
 mod tests {
     use super::*;
 
-    const NAMES: [(ErrorCode, &str); 15] = [
+    const NAMES: [(ErrorCode, &str); 17] = [
         (ErrorCode::SyntaxError, "SYNTAX_ERROR"),
         (ErrorCode::UnknownTable, "UNKNOWN_TABLE"),
         (ErrorCode::UnknownColumn, "UNKNOWN_COLUMN"),
@@ -124,6 +132,8 @@ mod tests {
         (ErrorCode::NotNullViolation, "NOT_NULL_VIOLATION"),
         (ErrorCode::StorageFull, "STORAGE_FULL"),
         (ErrorCode::TxnAborted, "TXN_ABORTED"),
+        (ErrorCode::ReadOnlyTxn, "READ_ONLY_TXN"),
+        (ErrorCode::TxnAlreadyOpen, "TXN_ALREADY_OPEN"),
         (ErrorCode::SchemaChangeInTxn, "SCHEMA_CHANGE_IN_TXN"),
         (ErrorCode::LockTimeout, "LOCK_TIMEOUT"),
         (ErrorCode::TooManyConnections, "TOO_MANY_CONNECTIONS"),

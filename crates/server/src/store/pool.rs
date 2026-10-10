@@ -7,11 +7,17 @@
 //!
 //! Positioned reads and writes, so a file needs no cursor and no lock of its
 //! own. That is a Unix call, which is what this server runs on.
+//!
+//! Three locks, always taken in this order: the pool, then the bytes of a
+//! frame, then the log. The pin count and the dirty mark of a frame sit
+//! outside the pool lock, so whoever holds the bytes of a page never waits
+//! for the pool and the order holds.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use protocol::DbError;
@@ -28,13 +34,21 @@ const SHARE: (u64, u64) = (5, 8);
 /// what allocating a page needs.
 const LEAST_FRAMES: usize = 2;
 
-/// What the pool knows about one frame.
+/// Which form of a page a read wants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mark {
+    /// The newest form, including a change the caller has not committed. What
+    /// a writer reads, because it has to see its own work.
+    Latest,
+    /// The form the log held below an offset, which is what a snapshot reads.
+    At(u64),
+}
+
+/// What the pool knows about one frame, under the pool lock.
 #[derive(Clone, Copy, Default)]
 struct Meta {
     /// The page the frame holds, or `None` for a frame that holds none.
     page: Option<PageId>,
-    pins: u32,
-    dirty: bool,
     /// The reference bit that the clock clears before it takes a frame.
     used: bool,
 }
@@ -88,6 +102,12 @@ struct Inner {
 pub struct BufferPool {
     /// The page bytes, one lock each, so two callers can hold two pages.
     frames: Vec<Mutex<Box<Page>>>,
+    /// How many callers hold each frame. A pin is only ever taken under the
+    /// pool lock, so a frame that reads as unpinned there stays unpinned.
+    pins: Vec<AtomicU32>,
+    /// Which frames hold a change the log has not got. Outside the pool lock,
+    /// so a page can be marked and asked about by whoever holds its bytes.
+    dirty: Vec<AtomicBool>,
     inner: Mutex<Inner>,
 }
 
@@ -104,6 +124,8 @@ impl BufferPool {
             frames: (0..frames)
                 .map(|_| Mutex::new(Box::new([0; PAGE_SIZE])))
                 .collect(),
+            pins: (0..frames).map(|_| AtomicU32::new(0)).collect(),
+            dirty: (0..frames).map(|_| AtomicBool::new(false)).collect(),
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
                 meta: vec![Meta::default(); frames],
@@ -168,12 +190,53 @@ impl BufferPool {
     /// drops.
     pub fn fetch(&self, id: PageId) -> Result<PageGuard<'_>, DbError> {
         let frame = self.pin(id)?;
-        Ok(PageGuard {
-            pool: self,
-            id,
-            bytes: self.frames[frame].lock().expect("the frame lock holds"),
-            dirty: false,
-        })
+        Ok(self.guard(id, frame))
+    }
+
+    /// Reads a page as of a mark.
+    ///
+    /// The pool holds the newest form of every page, so a frame answers a
+    /// snapshot only when nothing uncommitted sits in it and the log says the
+    /// page has not changed since the mark. Otherwise the reader gets a copy
+    /// of its own, and the pool keeps the newest form for the writer.
+    pub fn fetch_at(&self, id: PageId, mark: Mark) -> Result<PageRef<'_>, DbError> {
+        let Mark::At(upto) = mark else {
+            return self.fetch(id).map(PageRef::Pinned);
+        };
+        let open = {
+            let inner = self.inner.lock().expect("the pool lock holds");
+            inner.files.at(id.file)?
+        };
+        if self.may_answer(&open, id, upto) {
+            // Asked again with the bytes in hand, because the answer above
+            // came before the pin and a writer changes a page in place. A
+            // writer marks a page before it writes it, and it cannot reach
+            // the bytes while they are held here.
+            let page = self.fetch(id)?;
+            if self.holds_form(&open, page.frame, id.page_no, upto) {
+                return Ok(PageRef::Pinned(page));
+            }
+        }
+        Ok(PageRef::Own(read_as_of(&open, id.page_no, upto)?))
+    }
+
+    /// Is the pool's frame worth pinning for a read at this mark? Asked
+    /// before the pin, so the answer can go stale.
+    fn may_answer(&self, open: &Open, id: PageId, upto: u64) -> bool {
+        let frame = {
+            let inner = self.inner.lock().expect("the pool lock holds");
+            inner.map.get(&id).copied()
+        };
+        match frame {
+            Some(frame) => self.holds_form(open, frame, id.page_no, upto),
+            None => !open.wal.changed_since(open.table, id.page_no, upto),
+        }
+    }
+
+    /// Does a frame hold the form of a page that a mark asks for?
+    fn holds_form(&self, open: &Open, frame: usize, page_no: u32, upto: u64) -> bool {
+        !self.dirty[frame].load(Ordering::Acquire)
+            && !open.wal.changed_since(open.table, page_no, upto)
     }
 
     /// Takes a page for the caller to write. The bytes of a page that the
@@ -227,24 +290,51 @@ impl BufferPool {
     /// be writing to.
     pub fn commit(&self, wal: &Arc<Wal>) -> Result<(), DbError> {
         {
-            let mut inner = self.inner.lock().expect("the pool lock holds");
+            let inner = self.inner.lock().expect("the pool lock holds");
             for frame in 0..self.frames.len() {
-                let meta = inner.meta[frame];
-                let Some(page) = meta.page.filter(|_| meta.dirty) else {
+                if !self.dirty[frame].load(Ordering::Acquire) {
+                    continue;
+                }
+                let Some(page) = inner.meta[frame].page else {
                     continue;
                 };
                 let open = inner.files.at(page.file)?;
                 if !Arc::ptr_eq(&open.wal, wal) {
                     continue;
                 }
-                let Ok(bytes) = self.frames[frame].try_lock() else {
-                    return Err(storage_error("a page is held while the log is committed"));
-                };
+                // Waits for a reader that is part way through the page. The
+                // wait is short, and the log is never held while it happens.
+                let bytes = self.frames[frame].lock().expect("the frame lock holds");
                 open.wal.append_page(open.table, page.page_no, &bytes)?;
-                inner.meta[frame].dirty = false;
+                self.dirty[frame].store(false, Ordering::Release);
             }
         }
         wal.commit()
+    }
+
+    /// Drops every page of one log's files.
+    ///
+    /// What a rollback leaves behind: the pool holds forms of pages that no
+    /// one committed, and the log no longer holds the frames to correct them
+    /// with.
+    /// A frame someone is reading is given up as well: it leaves the page
+    /// table at once, so no later read finds it, and the clock takes the
+    /// frame itself once the reader lets go. Only a reader can hold a page
+    /// here, because a writer holds none between its statements.
+    pub fn discard(&self, wal: &Arc<Wal>) -> Result<(), DbError> {
+        let mut inner = self.inner.lock().expect("the pool lock holds");
+        for frame in 0..self.frames.len() {
+            let Some(page) = inner.meta[frame].page else {
+                continue;
+            };
+            if !Arc::ptr_eq(&inner.files.at(page.file)?.wal, wal) {
+                continue;
+            }
+            inner.map.remove(&page);
+            inner.meta[frame] = Meta::default();
+            self.dirty[frame].store(false, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// Puts one page in its table file, where the log is not. Only a
@@ -282,12 +372,16 @@ impl BufferPool {
     /// will need a per-frame state that says "being read".
     fn pin(&self, id: PageId) -> Result<usize, DbError> {
         let mut inner = self.inner.lock().expect("the pool lock holds");
+        self.pin_in(&mut inner, id)
+    }
+
+    fn pin_in(&self, inner: &mut Inner, id: PageId) -> Result<usize, DbError> {
         if let Some(&frame) = inner.map.get(&id) {
-            inner.meta[frame].pins += 1;
+            self.pins[frame].fetch_add(1, Ordering::AcqRel);
             inner.meta[frame].used = true;
             return Ok(frame);
         }
-        let frame = self.claim(&mut inner)?;
+        let frame = self.claim(inner)?;
         let open = inner.files.at(id.file)?;
         {
             let mut bytes = self.frames[frame].lock().expect("the frame lock holds");
@@ -301,10 +395,10 @@ impl BufferPool {
         inner.map.insert(id, frame);
         inner.meta[frame] = Meta {
             page: Some(id),
-            pins: 1,
-            dirty: false,
             used: true,
         };
+        self.pins[frame].store(1, Ordering::Release);
+        self.dirty[frame].store(false, Ordering::Release);
         Ok(frame)
     }
 
@@ -316,7 +410,9 @@ impl BufferPool {
             let frame = inner.hand;
             inner.hand = (inner.hand + 1) % frames;
             let meta = inner.meta[frame];
-            if meta.pins > 0 {
+            // A pin is only taken under this lock, so a frame that reads as
+            // unpinned here cannot be pinned before it is taken.
+            if self.pins[frame].load(Ordering::Acquire) > 0 {
                 continue;
             }
             if meta.used {
@@ -324,7 +420,7 @@ impl BufferPool {
                 continue;
             }
             if let Some(page) = meta.page {
-                if meta.dirty {
+                if self.dirty[frame].load(Ordering::Acquire) {
                     // To the log and not the table file. The frame is not
                     // committed, and recovery drops it unless one follows.
                     let open = inner.files.at(page.file)?;
@@ -334,6 +430,7 @@ impl BufferPool {
                 inner.map.remove(&page);
             }
             inner.meta[frame] = Meta::default();
+            self.dirty[frame].store(false, Ordering::Release);
             return Ok(frame);
         }
         Err(storage_error(format!(
@@ -359,20 +456,14 @@ impl BufferPool {
         Ok((len / PAGE_SIZE as u64) as u32)
     }
 
-    /// A pinned page is always mapped, because only a claim unmaps one and a
-    /// claim passes over every frame that is pinned.
-    fn unpin(&self, id: PageId) {
-        let mut inner = self.inner.lock().expect("the pool lock holds");
-        let frame = inner.map[&id];
-        inner.meta[frame].pins -= 1;
-    }
-
-    /// Marks a page as changed, the moment the caller asks to write it, so a
-    /// flush can see a page that is still being written.
-    fn mark_dirty(&self, id: PageId) {
-        let mut inner = self.inner.lock().expect("the pool lock holds");
-        let frame = inner.map[&id];
-        inner.meta[frame].dirty = true;
+    fn guard(&self, id: PageId, frame: usize) -> PageGuard<'_> {
+        PageGuard {
+            pool: self,
+            id,
+            frame,
+            bytes: self.frames[frame].lock().expect("the frame lock holds"),
+            dirty: false,
+        }
     }
 }
 
@@ -381,6 +472,9 @@ impl BufferPool {
 pub struct PageGuard<'a> {
     pool: &'a BufferPool,
     id: PageId,
+    /// The frame itself, so letting go and marking a change need no lookup
+    /// and no pool lock. A discard can unmap the page while it is held.
+    frame: usize,
     bytes: MutexGuard<'a, Box<Page>>,
     dirty: bool,
 }
@@ -396,7 +490,9 @@ impl PageGuard<'_> {
     pub fn bytes_mut(&mut self) -> &mut Page {
         if !self.dirty {
             self.dirty = true;
-            self.pool.mark_dirty(self.id);
+            // Before the bytes change, so a commit or a snapshot that sees
+            // the mark never reads a half-written page.
+            self.pool.dirty[self.frame].store(true, Ordering::Release);
         }
         &mut self.bytes
     }
@@ -404,7 +500,36 @@ impl PageGuard<'_> {
 
 impl Drop for PageGuard<'_> {
     fn drop(&mut self) {
-        self.pool.unpin(self.id);
+        self.pool.pins[self.frame].fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A page to read: one of the pool's own frames, or a copy for a reader the
+/// pool cannot answer from a frame.
+pub enum PageRef<'a> {
+    Pinned(PageGuard<'a>),
+    Own(Box<Page>),
+}
+
+impl PageRef<'_> {
+    pub fn bytes(&self) -> &Page {
+        match self {
+            PageRef::Pinned(page) => page.bytes(),
+            PageRef::Own(page) => page,
+        }
+    }
+}
+
+/// A page as of a mark, read past the pool. The log answers first, because it
+/// holds the newest form until a checkpoint moves it to the file.
+fn read_as_of(open: &Open, page_no: u32, upto: u64) -> Result<Box<Page>, DbError> {
+    match open.wal.read_page(open.table, page_no, upto)? {
+        Some(page) => Ok(page),
+        None => {
+            let mut page = Box::new([0; PAGE_SIZE]);
+            read_page(&open.file, page_no, &mut page)?;
+            Ok(page)
+        }
     }
 }
 
@@ -448,6 +573,154 @@ mod tests {
     fn stamped(pool: &BufferPool, id: PageId) -> u32 {
         let page = pool.fetch(id).expect("the page fetches");
         page_u32(page.bytes(), HEADER_SIZE)
+    }
+
+    /// Writes a number of its own into a page, so a read can tell which
+    /// form of it came back.
+    fn write(pool: &BufferPool, id: PageId, value: u32) {
+        let mut page = pool.fetch(id).expect("the page fetches");
+        write_u32(page.bytes_mut(), HEADER_SIZE, value);
+    }
+
+    fn read_at(pool: &BufferPool, id: PageId, mark: Mark) -> u32 {
+        let page = pool.fetch_at(id, mark).expect("the page reads");
+        page_u32(page.bytes(), HEADER_SIZE)
+    }
+
+    #[test]
+    fn a_read_at_a_mark_misses_a_change_committed_after_it() {
+        let (_dir, pool, wal, file) = pool("mark-after", 4);
+        let id = pool.allocate(file).unwrap();
+        stamp(&pool, id);
+        write(&pool, id, 1);
+        pool.commit(&wal).unwrap();
+        let mark = wal.committed();
+
+        write(&pool, id, 2);
+        pool.commit(&wal).unwrap();
+
+        assert_eq!(read_at(&pool, id, Mark::At(mark)), 1, "the older form");
+        assert_eq!(read_at(&pool, id, Mark::Latest), 2);
+        assert_eq!(
+            read_at(&pool, id, Mark::At(wal.committed())),
+            2,
+            "a mark taken now"
+        );
+    }
+
+    #[test]
+    fn a_read_at_a_mark_misses_a_change_no_one_committed() {
+        let (_dir, pool, wal, file) = pool("mark-dirty", 4);
+        let id = pool.allocate(file).unwrap();
+        stamp(&pool, id);
+        write(&pool, id, 1);
+        pool.commit(&wal).unwrap();
+        let mark = wal.committed();
+
+        // Changed in the pool and left there, which is a writer partway
+        // through its transaction.
+        write(&pool, id, 2);
+
+        assert_eq!(read_at(&pool, id, Mark::At(mark)), 1);
+        assert_eq!(read_at(&pool, id, Mark::Latest), 2, "the writer's own form");
+    }
+
+    #[test]
+    fn a_read_at_a_mark_takes_the_pooled_page_when_nothing_changed() {
+        let (_dir, pool, wal, file) = pool("mark-pooled", 4);
+        let id = pool.allocate(file).unwrap();
+        stamp(&pool, id);
+        write(&pool, id, 7);
+        pool.commit(&wal).unwrap();
+
+        let held = pool.held();
+        assert_eq!(read_at(&pool, id, Mark::At(wal.committed())), 7);
+        assert_eq!(pool.held(), held, "no frame was spent on a copy");
+    }
+
+    #[test]
+    fn a_read_at_a_mark_of_a_page_the_pool_lost_comes_off_the_log() {
+        // Two frames: the header page and one more, so a read of a third
+        // page pushes the one before it out.
+        let (_dir, pool, wal, file) = pool("mark-evicted", 2);
+        let first = pool.allocate(file).unwrap();
+        stamp(&pool, first);
+        write(&pool, first, 5);
+        pool.commit(&wal).unwrap();
+        let mark = wal.committed();
+        write(&pool, first, 6);
+        pool.commit(&wal).unwrap();
+
+        let second = pool.allocate(file).unwrap();
+        stamp(&pool, second);
+        pool.commit(&wal).unwrap();
+
+        assert_eq!(read_at(&pool, first, Mark::At(mark)), 5);
+    }
+
+    #[test]
+    fn a_read_at_a_mark_before_a_page_existed_comes_off_the_file() {
+        let (_dir, pool, wal, file) = pool("mark-before", 4);
+        // Nothing has been committed, so the mark is the start of the log.
+        let mark = wal.committed();
+        let id = pool.allocate(file).unwrap();
+        stamp(&pool, id);
+        write(&pool, id, 8);
+        pool.commit(&wal).unwrap();
+
+        // The log holds no frame of that page below the mark, so the file
+        // answers, and the file holds the page as the grow left it.
+        assert_eq!(read_at(&pool, id, Mark::At(mark)), 0);
+        assert_eq!(read_at(&pool, id, Mark::At(wal.committed())), 8);
+    }
+
+    #[test]
+    fn a_discard_drops_the_pages_of_one_log_only() {
+        let dir = Dir::new("discard");
+        let pool = BufferPool::with_frames(8);
+        let one = Arc::new(Wal::open(&dir.0.join("one"), 64 * 1024 * 1024).unwrap());
+        let two = Arc::new(Wal::open(&dir.0.join("two"), 64 * 1024 * 1024).unwrap());
+        let first = pool
+            .open(&dir.0.join("one").join("1.tbl"), 1, Arc::clone(&one))
+            .unwrap();
+        let second = pool
+            .open(&dir.0.join("two").join("1.tbl"), 1, Arc::clone(&two))
+            .unwrap();
+        let kept = pool.allocate(second).unwrap();
+        stamp(&pool, kept);
+        write(&pool, kept, 9);
+        let gone = pool.allocate(first).unwrap();
+        stamp(&pool, gone);
+        write(&pool, gone, 9);
+
+        pool.discard(&one).unwrap();
+
+        assert_eq!(stamped(&pool, kept), 9, "the other log kept its pages");
+        assert_eq!(
+            stamped(&pool, gone),
+            0,
+            "the change never committed, so the page reads as the file holds it"
+        );
+    }
+
+    #[test]
+    fn a_discard_takes_a_held_page_out_of_reach_and_frees_its_frame() {
+        let (_dir, pool, wal, file) = pool("discard-held", 4);
+        let id = pool.allocate(file).unwrap();
+        stamp(&pool, id);
+        write(&pool, id, 7);
+        pool.commit(&wal).unwrap();
+        let held = pool.fetch(id).unwrap();
+        assert_eq!(page_u32(held.bytes(), HEADER_SIZE), 7);
+
+        pool.discard(&wal).unwrap();
+
+        // The reader carries on with the page it holds, and the pool has
+        // forgotten it, so the frame comes back once the reader lets go.
+        assert_eq!(page_u32(held.bytes(), HEADER_SIZE), 7);
+        assert_eq!(pool.held(), 0);
+        drop(held);
+        assert_eq!(stamped(&pool, id), 7, "and it reads again off the log");
     }
 
     #[test]
@@ -591,13 +864,30 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_while_a_page_is_held_is_an_error_and_not_a_wait() {
+    fn a_commit_waits_for_a_page_that_is_held_and_then_takes_it() {
         let (_dir, pool, wal, file) = pool("held-commit", 4);
         let id = pool.allocate(file).unwrap();
-        let mut page = pool.fetch(id).unwrap();
-        SlottedPage::init(page.bytes_mut(), PageKind::Leaf);
-        let e = pool.commit(&wal).unwrap_err();
-        assert!(e.message.contains("held while the log is committed"), "{e}");
+        stamp(&pool, id);
+        write(&pool, id, 5);
+
+        let held = pool.fetch(id).unwrap();
+        let (sent, committed) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                pool.commit(&wal).expect("the commit goes through");
+                sent.send(()).expect("the test is listening");
+            });
+            assert!(
+                committed
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .is_err(),
+                "a reader held the page, so the commit could not have it yet"
+            );
+            drop(held);
+        });
+
+        assert!(wal.committed() > 0, "the page reached the log in the end");
+        assert_eq!(read_at(&pool, id, Mark::At(wal.committed())), 5);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use crate::catalog::registry::{Connected, Registry};
 use crate::exec::dml::{self, Answer};
 use crate::net::cancel::{CancelHandle, CancelRegistry, new_secret};
 use crate::sql::parser;
+use crate::txn::manager::{Transaction, TxnKind};
 
 /// One connection after its handshake. See [FR64].
 pub struct Session {
@@ -29,6 +30,9 @@ pub struct Session {
     /// read it between rows in milestone 11, so nothing reads it before then.
     #[allow(dead_code)]
     pub cancel: CancelHandle,
+    /// The transaction this connection opened, until it commits, rolls back
+    /// or disconnects.
+    txn: Option<Transaction>,
 }
 
 impl Session {
@@ -40,22 +44,27 @@ impl Session {
             secret,
             held,
             cancel: cancels.register(conn_id, secret),
+            txn: None,
         }
     }
 
-    /// The `Ready` that follows every statement. Milestone 10 reports a
-    /// transaction state other than `None`.
+    /// The `Ready` that follows every statement, carrying what the
+    /// connection holds.
     fn ready(&self) -> ServerMsg {
         ServerMsg::Ready {
             conn_id: self.conn_id,
             secret: self.secret.to_string(),
-            tx: TxState::None,
+            tx: match self.txn.as_ref().map(Transaction::kind) {
+                None => TxState::None,
+                Some(TxnKind::ReadWrite) => TxState::Open,
+                Some(TxnKind::ReadOnly) => TxState::ReadOnly,
+            },
         }
     }
 
     /// Answers each message until `Close`, a write error, a read error, or EOF.
     fn run(
-        &self,
+        &mut self,
         stream: &TcpStream,
         lines: impl Iterator<Item = io::Result<String>>,
         registry: &Registry,
@@ -79,9 +88,16 @@ impl Session {
     /// Rows go out as they arrive, so a result larger than the memory of the
     /// server still reaches the client. The error of a row that fails partway
     /// follows the rows that already went.
-    fn run_statement(&self, stream: &TcpStream, sql: &str, registry: &Registry) -> io::Result<()> {
-        let answer =
-            parser::parse(sql).and_then(|statement| dml::run(&statement, &self.held.db, registry));
+    fn run_statement(
+        &mut self,
+        stream: &TcpStream,
+        sql: &str,
+        registry: &Registry,
+    ) -> io::Result<()> {
+        let answer = {
+            let Session { held, txn, .. } = &mut *self;
+            parser::parse(sql).and_then(|statement| dml::run(&statement, &held.db, registry, txn))
+        };
         let mut plan = match answer {
             Err(e) => return self.reply(stream, &ServerMsg::from(e)),
             Ok(Answer::Changed { kind, rows }) => {
@@ -93,7 +109,7 @@ impl Session {
                     },
                 );
             }
-            Ok(Answer::Rows(plan)) => plan,
+            Ok(Answer::Rows { plan, .. }) => plan,
         };
         let cols = plan.schema().iter().map(describe).collect();
         self.reply(stream, &ServerMsg::RowDesc { cols })?;
@@ -119,14 +135,19 @@ impl Session {
 
     /// Frees the connection. The listener logs the close, because the line
     /// must follow the slot that the connection held. See [FR65].
-    fn on_disconnect(&mut self, cancels: &CancelRegistry) {
-        self.rollback_open_transaction();
+    fn on_disconnect(&mut self, cancels: &CancelRegistry, registry: &Registry) {
+        self.rollback_open_transaction(registry);
         cancels.unregister(self.conn_id);
     }
 
-    /// [FR65] rolls back the open transaction here. Milestone 10 adds the
-    /// transaction, so this milestone has nothing to roll back.
-    fn rollback_open_transaction(&mut self) {}
+    /// A client that leaves mid-transaction keeps none of it. See [FR65].
+    fn rollback_open_transaction(&mut self, registry: &Registry) {
+        if let Some(txn) = self.txn.take()
+            && let Err(e) = txn.rollback(registry.pool(), &self.held.db)
+        {
+            log::error!("connection {}: a rollback left the log: {e}", self.conn_id);
+        }
+    }
 
     /// Writes one message. An error reply also reaches the log. See [FR82].
     fn reply(&self, stream: &TcpStream, msg: &ServerMsg) -> io::Result<()> {
@@ -180,7 +201,7 @@ pub fn serve(stream: &TcpStream, conn_id: u64, cancels: &CancelRegistry, registr
     if session.reply(stream, &session.ready()).is_ok() {
         session.run(stream, &mut lines, registry);
     }
-    session.on_disconnect(cancels);
+    session.on_disconnect(cancels, registry);
 }
 
 /// What the first line of a connection asks for. See [FR62] and [FR66].
@@ -474,11 +495,11 @@ mod tests {
     #[test]
     fn a_disconnect_unregisters_the_connection() {
         let dir = Dir::new("session-disconnect");
-        let (_registry, held) = dir.shop();
+        let (registry, held) = dir.shop();
         let cancels = CancelRegistry::new();
         let mut session = Session::start(5, held, &cancels);
         let secret = session.secret;
-        session.on_disconnect(&cancels);
+        session.on_disconnect(&cancels, &registry);
         assert!(!cancels.cancel(5, secret));
     }
 }

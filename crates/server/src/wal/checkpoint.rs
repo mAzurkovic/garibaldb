@@ -6,10 +6,18 @@ use std::sync::Arc;
 use protocol::DbError;
 
 use crate::store::pool::BufferPool;
+use crate::txn::manager::Readers;
 use crate::wal::writer::Wal;
 
-/// How large a log grows before a checkpoint empties it.
-pub const THRESHOLD: u64 = 64 * 1024 * 1024;
+/// Should a checkpoint run now?
+///
+/// Only once the log has grown past the threshold, and only while no reader is
+/// behind it: a checkpoint empties the log into the table files, so a reader
+/// at an older mark would find the newest rows in the file and none of the
+/// frames that held the older ones.
+pub fn due(wal: &Wal, readers: &Readers, threshold: u64) -> bool {
+    wal.end() > threshold && readers.oldest().is_none_or(|mark| mark >= wal.committed())
+}
 
 /// Writes every page the log holds into its table file, then empties the log.
 ///
@@ -54,6 +62,32 @@ mod tests {
     fn stamped(pool: &BufferPool, id: PageId) -> u32 {
         let page = pool.fetch(id).expect("the page fetches");
         page_u32(page.bytes(), HEADER_SIZE)
+    }
+
+    #[test]
+    fn a_checkpoint_is_due_on_size_and_never_while_a_reader_is_behind() {
+        let (_dir, pool, wal, file) = testing::table("checkpoint-due", 8);
+        let readers = Arc::new(Readers::default());
+        let id = pool.allocate(file).unwrap();
+        stamp(&pool, id);
+        pool.commit(&wal).unwrap();
+        let grown = wal.end();
+
+        assert!(!due(&wal, &readers, grown), "the log has not passed it");
+        assert!(due(&wal, &readers, grown - 1), "and now it has");
+
+        // A reader at the mark of now needs no frame a checkpoint takes.
+        let current = readers.lease(wal.committed());
+        assert!(due(&wal, &readers, grown - 1));
+
+        // One more commit leaves that reader behind, and the checkpoint waits
+        // for it.
+        stamp(&pool, id);
+        pool.commit(&wal).unwrap();
+        assert!(!due(&wal, &readers, grown - 1), "its frames are needed");
+
+        drop(current);
+        assert!(due(&wal, &readers, grown - 1), "the reader ended");
     }
 
     #[test]

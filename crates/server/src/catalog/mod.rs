@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex};
 use protocol::{DataType, DbError, ErrorCode};
 use serde::{Deserialize, Serialize};
 
+use crate::txn::lock::WriteLock;
+use crate::txn::manager::Readers;
 use crate::wal::writer::Wal;
 
 /// The schema file of a database.
@@ -195,6 +197,10 @@ pub struct Database {
     pub name: String,
     pub catalog: Mutex<Catalog>,
     pub wal: Arc<Wal>,
+    /// Taken by a write and held to its commit or rollback.
+    pub lock: WriteLock,
+    /// The marks of the readers that are live now.
+    pub readers: Arc<Readers>,
 }
 
 #[cfg(test)]

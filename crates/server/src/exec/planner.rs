@@ -11,7 +11,7 @@ use crate::exec::scan::Scan;
 use crate::sql::ast::{CompareOp, Expr, Selection};
 use crate::store::btree::BTree;
 use crate::store::page::FileId;
-use crate::store::pool::BufferPool;
+use crate::store::pool::{BufferPool, Mark};
 
 /// The plan of a read: a scan, then the condition, then the count, then the
 /// columns asked for.
@@ -22,8 +22,9 @@ pub fn plan<'a>(
     limit: Option<u64>,
     pool: &'a BufferPool,
     file: FileId,
+    mark: Mark,
 ) -> Result<Box<dyn Operator + 'a>, DbError> {
-    let tree = BTree::open(pool, file, table);
+    let tree = BTree::open(pool, file, table, mark);
     let (from, to) = key_bounds(table, condition);
     let mut plan: Box<dyn Operator + 'a> = Box::new(Scan::new(
         &tree,

@@ -19,7 +19,7 @@ use crate::store::page::{
     self, FileHeader, FileId, HEADER_SIZE, PAGE_SIZE, Page, PageHeader, PageId, PageKind,
     SLOT_SIZE, SlottedPage,
 };
-use crate::store::pool::BufferPool;
+use crate::store::pool::{BufferPool, Mark, PageRef};
 use crate::store::storage_error;
 
 /// The largest record a page can hold: the page, less its header and one slot.
@@ -37,6 +37,9 @@ pub struct BTree<'a> {
     file: FileId,
     columns: Vec<ColumnDef>,
     key_index: usize,
+    /// Which form of a page every read of this tree takes. A tree that
+    /// writes reads `Latest`, because it has to see its own work.
+    mark: Mark,
 }
 
 /// The way down to one leaf.
@@ -47,13 +50,19 @@ struct Path {
 }
 
 impl<'a> BTree<'a> {
-    pub fn open(pool: &'a BufferPool, file: FileId, table: &TableDef) -> BTree<'a> {
+    pub fn open(pool: &'a BufferPool, file: FileId, table: &TableDef, mark: Mark) -> BTree<'a> {
         BTree {
             pool,
             file,
             columns: table.columns.clone(),
             key_index: table.pk_index,
+            mark,
         }
+    }
+
+    /// A page of this tree, as of the mark it reads at.
+    fn read(&self, page_no: u32) -> Result<PageRef<'a>, DbError> {
+        self.pool.fetch_at(self.page(page_no), self.mark)
     }
 
     /// The row of a key, or none when the tree holds it not.
@@ -63,7 +72,7 @@ impl<'a> BTree<'a> {
             return Ok(None);
         }
         let leaf = self.descend(root, key)?.leaf;
-        let page = self.pool.fetch(self.page(leaf))?;
+        let page = self.read(leaf)?;
         let (slot, found) = self.search(page.bytes(), PageKind::Leaf, key)?;
         match found {
             false => Ok(None),
@@ -87,7 +96,7 @@ impl<'a> BTree<'a> {
         };
         let path = self.descend(root, &key)?;
         let (slot, found) = {
-            let page = self.pool.fetch(self.page(path.leaf))?;
+            let page = self.read(path.leaf)?;
             self.search(page.bytes(), PageKind::Leaf, &key)?
         };
         if found {
@@ -151,7 +160,7 @@ impl<'a> BTree<'a> {
             Bound::Unbounded => (self.leftmost(root)?, 0),
             Bound::Included(key) | Bound::Excluded(key) => {
                 let leaf = self.descend(root, key)?.leaf;
-                let page = self.pool.fetch(self.page(leaf))?;
+                let page = self.read(leaf)?;
                 let (slot, found) = self.search(page.bytes(), PageKind::Leaf, key)?;
                 // An excluded bound that is there starts after it.
                 let skip = found && matches!(from, Bound::Excluded(_));
@@ -252,7 +261,7 @@ impl<'a> BTree<'a> {
     }
 
     fn root(&self) -> Result<u32, DbError> {
-        let page = self.pool.fetch(self.page(0))?;
+        let page = self.read(0)?;
         Ok(FileHeader::read(page.bytes())?.root)
     }
 
@@ -283,7 +292,7 @@ impl<'a> BTree<'a> {
         let mut parents = Vec::new();
         loop {
             let step = {
-                let page = self.pool.fetch(self.page(page_no))?;
+                let page = self.read(page_no)?;
                 match PageHeader::read(page.bytes())?.kind {
                     PageKind::Leaf => None,
                     PageKind::Interior => {
@@ -316,7 +325,7 @@ impl<'a> BTree<'a> {
         let mut page_no = page_no;
         loop {
             let child = {
-                let page = self.pool.fetch(self.page(page_no))?;
+                let page = self.read(page_no)?;
                 match PageHeader::read(page.bytes())?.kind {
                     PageKind::Leaf => return Ok(page_no),
                     PageKind::Interior => BTree::split_entry(record(page.bytes(), 0)?)?.1,
@@ -332,13 +341,13 @@ impl<'a> BTree<'a> {
     /// The lowest key under a page.
     fn lowest_key(&self, page_no: u32) -> Result<Value, DbError> {
         let leaf = self.leftmost(page_no)?;
-        let page = self.pool.fetch(self.page(leaf))?;
+        let page = self.read(leaf)?;
         self.slot_key(page.bytes(), PageKind::Leaf, 0)
     }
 
     /// Every record of a page, in slot order.
     fn records(&self, page_no: u32) -> Result<Vec<Vec<u8>>, DbError> {
-        let page = self.pool.fetch(self.page(page_no))?;
+        let page = self.read(page_no)?;
         (0..page::slot_count(page.bytes()))
             .map(|index| record(page.bytes(), index).map(<[u8]>::to_vec))
             .collect()
@@ -356,7 +365,7 @@ impl<'a> BTree<'a> {
         let right = self.pool.allocate(self.file)?.page_no;
 
         let (old_next, old_prev) = {
-            let page = self.pool.fetch(self.page(leaf))?;
+            let page = self.read(leaf)?;
             let header = PageHeader::read(page.bytes())?;
             (header.next, header.prev)
         };
@@ -451,7 +460,7 @@ impl<'a> BTree<'a> {
     /// Takes an empty leaf out of the tree and gives its page back.
     fn unlink(&self, path: Path) -> Result<(), DbError> {
         let (next, prev) = {
-            let page = self.pool.fetch(self.page(path.leaf))?;
+            let page = self.read(path.leaf)?;
             let header = PageHeader::read(page.bytes())?;
             (header.next, header.prev)
         };
@@ -501,7 +510,7 @@ impl Cursor<'_> {
     pub fn next(&mut self) -> Result<Option<Vec<u8>>, DbError> {
         while !self.done {
             let (row, next) = {
-                let page = self.tree.pool.fetch(self.tree.page(self.page_no))?;
+                let page = self.tree.read(self.page_no)?;
                 let row = page::slot(page.bytes(), self.slot).map(<[u8]>::to_vec);
                 (row, PageHeader::read(page.bytes())?.next)
             };
@@ -703,10 +712,34 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_at_a_mark_returns_the_rows_of_that_moment() {
+        let (_dir, pool, wal, file) = fixture("scan-at-mark", 8);
+        let table = table(DataType::Integer);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
+        for key in 1..=3 {
+            tree.insert(&int_row(&table, key)).unwrap();
+        }
+        pool.commit(&wal).unwrap();
+        let mark = wal.committed();
+
+        for key in 4..=6 {
+            tree.insert(&int_row(&table, key)).unwrap();
+        }
+        tree.delete(&Value::Integer(2)).unwrap();
+        pool.commit(&wal).unwrap();
+
+        let then = BTree::open(&pool, file, &table, Mark::At(mark));
+        assert_eq!(keys(&then), vec![1, 2, 3]);
+        assert_eq!(keys(&tree), vec![1, 3, 4, 5, 6]);
+        assert!(then.get(&Value::Integer(5)).unwrap().is_none());
+        assert!(then.get(&Value::Integer(2)).unwrap().is_some());
+    }
+
+    #[test]
     fn an_empty_tree_holds_nothing() {
         let (_dir, pool, _wal, file) = fixture("empty", 8);
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         assert_eq!(tree.get(&Value::Integer(1)).unwrap(), None);
         assert_eq!(keys(&tree), Vec::<i64>::new());
         assert_eq!(tree.delete(&Value::Integer(1)).unwrap(), None);
@@ -725,7 +758,7 @@ mod tests {
             ),
         ] {
             let table = table(ty);
-            let tree = BTree::open(&pool, file, &table);
+            let tree = BTree::open(&pool, file, &table, Mark::Latest);
             let entry = tree.entry(&key, 42).unwrap();
             let (bytes, child) = BTree::split_entry(&entry).unwrap();
             assert_eq!(child, 42);
@@ -743,7 +776,7 @@ mod tests {
     fn a_search_finds_every_key_of_a_page_and_places_the_rest() {
         let (_dir, pool, _wal, file) = fixture("search", 8);
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         // Even keys only, so every odd key is one that is not there.
         let mut page = Box::new([0; PAGE_SIZE]);
         {
@@ -769,7 +802,7 @@ mod tests {
     fn a_search_of_an_empty_page_gives_the_first_slot() {
         let (_dir, pool, _wal, file) = fixture("search-empty", 8);
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         let mut page = Box::new([0; PAGE_SIZE]);
         SlottedPage::init(&mut page, PageKind::Leaf);
         assert_eq!(
@@ -788,7 +821,7 @@ mod tests {
         ] {
             let (_dir, pool, _wal, file) = fixture(label, 8);
             let table = table(DataType::Integer);
-            let tree = BTree::open(&pool, file, &table);
+            let tree = BTree::open(&pool, file, &table, Mark::Latest);
             for key in &order {
                 tree.insert(&int_row(&table, *key)).unwrap();
             }
@@ -807,7 +840,7 @@ mod tests {
     fn enough_rows_make_a_tree_of_more_than_one_level() {
         let (_dir, pool, _wal, file) = fixture("levels", 16);
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         tree.insert(&int_row(&table, 1)).unwrap();
         assert_eq!(root_kind(&tree), PageKind::Leaf, "one row needs one leaf");
         for key in 2..400 {
@@ -822,7 +855,7 @@ mod tests {
         // Wide rows, so few fit a leaf and the leaves alone fill the root.
         let (_dir, pool, wal, file) = fixture("deep", 32);
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         let wide = "x".repeat(400);
         let count = 15_000;
         for (written, key) in shuffled(count).into_iter().enumerate() {
@@ -864,7 +897,7 @@ mod tests {
         for (ty, key) in cases {
             let (_dir, pool, _wal, file) = fixture(&format!("duplicate-{ty}"), 8);
             let table = table(ty);
-            let tree = BTree::open(&pool, file, &table);
+            let tree = BTree::open(&pool, file, &table, Mark::Latest);
             tree.insert(&row(&table, key.clone(), "first")).unwrap();
             let e = tree
                 .insert(&row(&table, key.clone(), "second"))
@@ -880,7 +913,7 @@ mod tests {
     fn a_decimal_key_of_the_same_value_written_differently_is_a_duplicate() {
         let (_dir, pool, _wal, file) = fixture("decimal-key", 8);
         let table = table(DataType::Decimal { p: 10, s: 2 });
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         tree.insert(&row(&table, Value::Decimal("12.20".parse().unwrap()), "a"))
             .unwrap();
         let e = tree
@@ -898,7 +931,7 @@ mod tests {
     fn a_row_that_no_page_could_hold_is_refused() {
         let (_dir, pool, _wal, file) = fixture("too-wide", 8);
         let table = wide_table(5);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         let row = wide_row(&table, 1);
         assert!(row.len() > MAX_RECORD, "the row is {} bytes", row.len());
         let e = tree.insert(&row).err().unwrap();
@@ -909,7 +942,7 @@ mod tests {
     fn a_row_that_only_just_fits_a_page_goes_in() {
         let (_dir, pool, _wal, file) = fixture("just-fits", 8);
         let table = wide_table(3);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         assert!(
             wide_row(&table, 1).len() > MAX_RECORD / 2,
             "one row to a leaf"
@@ -933,7 +966,7 @@ mod tests {
     fn a_page_of_one_record_cannot_be_split() {
         let (_dir, pool, _wal, file) = fixture("no-split", 8);
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         let leaf = tree.plant().unwrap();
         let e = tree.split_leaf(leaf, 0, &int_row(&table, 1)).err().unwrap();
         assert!(e.message.contains("cannot be split"), "{e}");
@@ -943,7 +976,7 @@ mod tests {
     fn every_bound_takes_and_leaves_the_right_rows() {
         let (_dir, pool, _wal, file) = fixture("bounds", 8);
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         for key in 0..200 {
             tree.insert(&int_row(&table, key)).unwrap();
         }
@@ -984,7 +1017,7 @@ mod tests {
     fn a_scan_crosses_every_leaf_of_a_tree() {
         let (_dir, pool, _wal, file) = fixture("cross", 4);
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         for key in 0..600 {
             tree.insert(&int_row(&table, key)).unwrap();
         }
@@ -997,7 +1030,7 @@ mod tests {
     fn a_deleted_key_is_gone_from_a_read_and_from_a_scan() {
         let (_dir, pool, _wal, file) = fixture("delete-one", 8);
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         for key in 0..100 {
             tree.insert(&int_row(&table, key)).unwrap();
         }
@@ -1016,7 +1049,7 @@ mod tests {
     fn deleting_every_key_empties_the_tree_and_gives_the_pages_back() {
         let (_dir, pool, _wal, file) = fixture("delete-all", 8);
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         for key in 0..400 {
             tree.insert(&int_row(&table, key)).unwrap();
         }
@@ -1045,7 +1078,7 @@ mod tests {
     fn deleting_half_the_keys_leaves_the_rest_in_order() {
         let (_dir, pool, _wal, file) = fixture("delete-half", 8);
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         for key in shuffled(1000) {
             tree.insert(&int_row(&table, key)).unwrap();
         }
@@ -1069,7 +1102,7 @@ mod tests {
         // A pool far smaller than the tree, so pages are evicted throughout.
         let (_dir, pool, wal, file) = fixture("load", 64);
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         let count = 50_000;
         for (written, key) in shuffled(count).into_iter().enumerate() {
             tree.insert(&int_row(&table, key)).unwrap();
@@ -1101,7 +1134,7 @@ mod tests {
     fn a_row_whose_key_is_null_is_refused() {
         let (_dir, pool, _wal, file) = fixture("null-key", 8);
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         let row = codec::encode_row(
             &table.columns,
             &[Cell::Value(Value::Null), Cell::Value(Value::Null)],
@@ -1117,7 +1150,7 @@ mod tests {
         // A key column of text could in principle hold a value too large for
         // a record, and a key the tree cannot read is no key at all.
         let table = table(DataType::Text);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         let chain = Cell::Chain(codec::ChainPtr { head: 9, len: 4096 });
         let row =
             codec::encode_row(&table.columns, &[chain.clone(), Cell::Value(Value::Null)]).unwrap();
@@ -1134,7 +1167,7 @@ mod tests {
     fn a_page_that_is_no_part_of_a_tree_is_an_error() {
         let (_dir, pool, _wal, file) = fixture("wrong-kind", 8);
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         tree.insert(&int_row(&table, 1)).unwrap();
 
         // The root becomes a page of a kind no tree holds.
@@ -1156,7 +1189,7 @@ mod tests {
     fn an_emptied_leaf_is_unlinked_from_the_leaf_before_it() {
         let (_dir, pool, _wal, file) = fixture("unlink-middle", 8);
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
         for key in 0..400 {
             tree.insert(&int_row(&table, key)).unwrap();
         }
@@ -1194,7 +1227,7 @@ mod tests {
             .open(&dir.0.join("1.tbl"), 1, Arc::clone(&wal))
             .unwrap();
         let table = table(DataType::Integer);
-        let tree = BTree::open(&pool, file, &table);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
 
         // One transaction holds its whole change set in the log, so a long
         // enough one runs out of log.
