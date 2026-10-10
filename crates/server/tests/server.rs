@@ -523,19 +523,20 @@ fn sort_files(data_dir: &std::path::Path) -> usize {
 /// with its own code and the connection carries the next one.
 #[test]
 fn a_cancel_stops_a_statement_and_leaves_the_connection_open() {
-    const ROWS: i64 = 4000;
+    const ROWS: i64 = 5000;
     let data = DataDir::new("cancel-socket");
-    let server = Server::start_on(&data.0, &[]);
+    // A sort that spills a run every few rows, so the server has a second of
+    // work to do before it writes the first row. A cancel arrives in a
+    // fraction of that, and nothing of the answer depends on how much the
+    // socket of the asking connection will hold.
+    let server = Server::start_on(&data.0, &["--sort-bytes", "512"]);
     let mut conn = server.connect();
     let (conn_id, secret) = conn.start_up();
     conn.run("CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL)");
     conn.run(&bulk(ROWS));
 
-    // Asked for and left unread, so the server fills the socket and blocks
-    // part way through writing the rows. The statement is certainly still
-    // running when the cancel lands.
     conn.send(&ClientMsg::Query {
-        sql: "SELECT label FROM item".to_string(),
+        sql: "SELECT label FROM item ORDER BY label".to_string(),
     });
     let mut canceller = server.connect();
     canceller.send(&ClientMsg::Cancel {
@@ -554,8 +555,8 @@ fn a_cancel_stops_a_statement_and_leaves_the_connection_open() {
         }
     };
     assert_eq!(code, Some(ErrorCode::Cancelled));
-    assert!(rows > 0, "it had started writing rows");
-    assert!(rows < ROWS, "and it did not finish");
+    assert_eq!(rows, 0, "a sort writes nothing until it has every row");
+    assert_eq!(sort_files(&data.0), 0, "the runs went with the statement");
 
     // The ready that closes the cancelled statement, then the next one runs.
     assert!(matches!(conn.expect(), ServerMsg::Ready { .. }));
