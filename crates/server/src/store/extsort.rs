@@ -95,32 +95,49 @@ impl RunWriter {
             .map_err(|e| failed(&self.path, e))
     }
 
-    /// Settles the run and opens it for reading.
-    fn finish(mut self, columns: &[ColumnDef], key: usize) -> Result<RunFile, DbError> {
+    /// Settles the run and closes it.
+    fn finish(mut self) -> Result<RunFile, DbError> {
         self.out.flush().map_err(|e| failed(&self.path, e))?;
-        RunFile::open(self.path, columns, key)
+        Ok(RunFile { path: self.path })
     }
 }
 
-/// One run of rows in order, on disk.
+/// One run of rows in order, on disk and closed.
+///
+/// A run holds no file of its own, because a sort of a large table has
+/// thousands of them and the open files of a process are few.
 pub struct RunFile {
     path: PathBuf,
+}
+
+impl Drop for RunFile {
+    /// A run goes as soon as nothing reads it, so a sort holds one copy of
+    /// its rows on disk and not one for every pass.
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// A run being read, a row at a time. One of these for each run of a merge,
+/// so a merge holds the fan-in in open files and no more.
+struct Reading {
+    run: RunFile,
     reader: BufReader<File>,
     /// The row at the front, which a merge looks at without taking it.
     head: Option<Held>,
 }
 
-impl RunFile {
+impl Reading {
     /// Opens a run and reads its first row.
-    fn open(path: PathBuf, columns: &[ColumnDef], key: usize) -> Result<RunFile, DbError> {
-        let file = File::open(&path).map_err(|e| failed(&path, e))?;
-        let mut run = RunFile {
+    fn open(run: RunFile, columns: &[ColumnDef], key: usize) -> Result<Reading, DbError> {
+        let file = File::open(&run.path).map_err(|e| failed(&run.path, e))?;
+        let mut reading = Reading {
             reader: BufReader::with_capacity(READ_BUFFER, file),
-            path,
+            run,
             head: None,
         };
-        run.advance(columns, key)?;
-        Ok(run)
+        reading.advance(columns, key)?;
+        Ok(reading)
     }
 
     /// The row at the front of the run, or none at its end.
@@ -144,12 +161,12 @@ impl RunFile {
                 self.head = None;
                 return Ok(());
             }
-            Err(e) => return Err(failed(&self.path, e)),
+            Err(e) => return Err(failed(&self.run.path, e)),
         }
         let mut record = vec![0; u32::from_le_bytes(len) as usize];
         self.reader
             .read_exact(&mut record)
-            .map_err(|e| failed(&self.path, e))?;
+            .map_err(|e| failed(&self.run.path, e))?;
         self.head = Some(Held {
             key: decode(columns, &record)?.swap_remove(key),
             record,
@@ -158,23 +175,33 @@ impl RunFile {
     }
 }
 
-impl Drop for RunFile {
-    /// A run goes as soon as nothing reads it, so a sort holds one copy of
-    /// its rows on disk and not one for every pass.
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
 /// A merge of several runs into one stream of rows in order.
 struct Merge {
-    runs: Vec<RunFile>,
+    runs: Vec<Reading>,
     columns: Vec<ColumnDef>,
     key: usize,
     descending: bool,
 }
 
 impl Merge {
+    /// Opens the runs of one merge, which is where their files are held.
+    fn open(
+        runs: Vec<RunFile>,
+        columns: Vec<ColumnDef>,
+        key: usize,
+        descending: bool,
+    ) -> Result<Merge, DbError> {
+        Ok(Merge {
+            runs: runs
+                .into_iter()
+                .map(|run| Reading::open(run, &columns, key))
+                .collect::<Result<_, DbError>>()?,
+            columns,
+            key,
+            descending,
+        })
+    }
+
     /// The next row of the runs.
     ///
     /// The front of every run is looked at, so a row costs the fan-in in
@@ -308,12 +335,12 @@ impl ExternalSort {
             self.pass(cancel)?;
         }
         Ok(Sorted {
-            rows: Source::Merge(Merge {
-                runs: std::mem::take(&mut self.runs),
-                columns: self.columns.clone(),
-                key: self.key,
-                descending: self.descending,
-            }),
+            rows: Source::Merge(Merge::open(
+                std::mem::take(&mut self.runs),
+                self.columns.clone(),
+                self.key,
+                self.descending,
+            )?),
             _dir: Arc::clone(&self.dir),
         })
     }
@@ -330,7 +357,7 @@ impl ExternalSort {
         for row in &held {
             run.push(row)?;
         }
-        self.runs.push(run.finish(&self.columns, self.key)?);
+        self.runs.push(run.finish()?);
         Ok(())
     }
 
@@ -340,12 +367,12 @@ impl ExternalSort {
         let mut merged = Vec::new();
         while !left.is_empty() {
             let take = left.len().min(self.fan_in);
-            let mut merge = Merge {
-                runs: left.drain(..take).collect(),
-                columns: self.columns.clone(),
-                key: self.key,
-                descending: self.descending,
-            };
+            let mut merge = Merge::open(
+                left.drain(..take).collect(),
+                self.columns.clone(),
+                self.key,
+                self.descending,
+            )?;
             let mut run = RunWriter::create(self.path())?;
             // Straight out of the merge and into the run, so a pass holds no
             // more rows than the fronts of the runs it reads.
@@ -353,7 +380,7 @@ impl ExternalSort {
                 cancel.check()?;
                 run.push(&row)?;
             }
-            merged.push(run.finish(&self.columns, self.key)?);
+            merged.push(run.finish()?);
         }
         self.runs = merged;
         Ok(())
@@ -573,6 +600,25 @@ mod tests {
                 Value::Null
             ]
         );
+    }
+
+    #[test]
+    fn a_sort_of_many_runs_holds_the_fan_in_in_open_files() {
+        let dir = Dir::new("sort-many-runs");
+        let columns = columns(DataType::Integer);
+        // A run for every row, and far more runs than the fan-in, so the
+        // merge opens a few of them at a time and never all of them.
+        let mut sort = ExternalSort::new(&dir.0, columns.clone(), 0, false, 1, 4).unwrap();
+        for key in (0..400).rev() {
+            sort.add(&row(Value::Integer(key))).unwrap();
+        }
+
+        let mut rows = sort.finish(&CancelHandle::new()).unwrap();
+        let mut keys = Vec::new();
+        while let Some(row) = rows.next(&columns).unwrap() {
+            keys.push(row[0].clone());
+        }
+        assert_eq!(keys, ints(&(0..400).collect::<Vec<i64>>()));
     }
 
     #[test]
