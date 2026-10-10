@@ -37,10 +37,10 @@ No `JOIN`, no indexes, no aggregates, no replication, no authentication.
 
 ## Status
 
-Milestone 9 of 12 done. It is a durable database: `INSERT` and `SELECT` work, a committed row
-outlives a `kill -9`, and a write that never committed leaves no trace. No transaction yet, so
-`BEGIN` is still refused, and a power cut against a real disk stays unproven. `ORDER BY` arrives
-in milestone 11.
+Milestone 10 of 12 done. It is a transactional database: `BEGIN`, `COMMIT` and `ROLLBACK` work,
+one writer at a time holds each database, a read-only transaction reads a snapshot and waits for
+no one, and none of the six known isolation anomalies occurs. A power cut against a real disk
+stays unproven. `ORDER BY` arrives in milestone 11.
 See [docs/projectplan.md](docs/projectplan.md).
 
 ## Build
