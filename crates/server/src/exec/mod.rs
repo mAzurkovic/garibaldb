@@ -9,3 +9,4 @@ pub mod filter;
 pub mod operator;
 pub mod planner;
 pub mod scan;
+pub mod sort;

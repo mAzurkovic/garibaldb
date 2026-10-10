@@ -45,6 +45,8 @@ pub struct Limits {
     pub checkpoint: u64,
     /// How long a write waits for the lock of its database.
     pub lock_timeout: Duration,
+    /// The bytes of rows one sort holds before it spills to `tmp/`.
+    pub sort: u64,
 }
 
 pub struct Registry {
@@ -247,8 +249,20 @@ impl Registry {
                     log::info!("deleted {}, which no catalog names", path.display());
                 }
             }
+            // A sort writes its runs under `tmp/`, and a crash leaves them
+            // there. Nothing reads a run it did not write.
+            match fs::remove_dir_all(dir.join("tmp")) {
+                Ok(()) => log::info!("cleared the sort files of {}", dir.display()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
+    }
+
+    /// Where a sort of this database writes its runs.
+    pub fn sort_dir(&self, db: &Database) -> PathBuf {
+        self.data_dir.join(&db.name).join("tmp")
     }
 }
 
@@ -515,6 +529,21 @@ mod tests {
         assert!(!db.join("99.tbl").exists(), "no catalog names this one");
         assert!(db.join("notes.txt").is_file());
         assert!(dir.0.join("stray.tbl").is_file());
+    }
+
+    #[test]
+    fn a_sweep_clears_the_sort_files_of_every_database() {
+        let dir = Dir::new("sweep-tmp");
+        let (registry, held) = dir.shop();
+        let tmp = registry.sort_dir(&held.db);
+        fs::create_dir_all(tmp.join("17-0")).expect("a sort directory");
+        fs::write(tmp.join("17-0").join("0.run"), b"a run no one owns").expect("a run file");
+
+        registry.sweep().expect("the sweep runs");
+
+        assert!(!tmp.exists(), "the sort files went");
+        // And a database that never sorted sweeps just the same.
+        registry.sweep().expect("the sweep runs again");
     }
 
     #[test]

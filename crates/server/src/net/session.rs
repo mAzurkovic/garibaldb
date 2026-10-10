@@ -11,9 +11,9 @@ use std::sync::Arc;
 use protocol::error::ErrorCode;
 use protocol::message::{ClientMsg, ColumnDesc, PROTOCOL_VERSION, ServerMsg, TxState};
 
+use crate::cancel::{CancelHandle, CancelRegistry, new_secret};
 use crate::catalog::registry::{Connected, Registry};
 use crate::exec::dml::{self, Answer};
-use crate::net::cancel::{CancelHandle, CancelRegistry, new_secret};
 use crate::sql::parser;
 use crate::txn::manager::{Transaction, TxnKind};
 
@@ -27,8 +27,7 @@ pub struct Session {
     /// the database for a `DROP DATABASE`.
     pub held: Connected,
     /// The flag that a `Cancel` on a second connection sets. The operators
-    /// read it between rows in milestone 11, so nothing reads it before then.
-    #[allow(dead_code)]
+    /// read it between rows.
     pub cancel: CancelHandle,
     /// The transaction this connection opened, until it commits, rolls back
     /// or disconnects.
@@ -94,9 +93,14 @@ impl Session {
         sql: &str,
         registry: &Registry,
     ) -> io::Result<()> {
+        // One cancel stops one statement, so the flag starts clear.
+        self.cancel.clear();
         let answer = {
-            let Session { held, txn, .. } = &mut *self;
-            parser::parse(sql).and_then(|statement| dml::run(&statement, &held.db, registry, txn))
+            let Session {
+                held, txn, cancel, ..
+            } = &mut *self;
+            parser::parse(sql)
+                .and_then(|statement| dml::run(&statement, &held.db, registry, txn, cancel))
         };
         let mut plan = match answer {
             Err(e) => return self.reply(stream, &ServerMsg::from(e)),

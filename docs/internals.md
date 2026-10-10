@@ -500,6 +500,7 @@ classDiagram
         TXN_ALREADY_OPEN
         SCHEMA_CHANGE_IN_TXN
         LOCK_TIMEOUT
+        CANCELLED
         TOO_MANY_CONNECTIONS
     }
     class DbError {

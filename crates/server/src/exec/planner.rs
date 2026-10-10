@@ -1,46 +1,108 @@
 //! A statement into a tree of operators.
 
 use std::ops::Bound;
+use std::path::PathBuf;
 
-use protocol::{DbError, Value};
+use protocol::{DbError, ErrorCode, Value};
 
-use crate::catalog::TableDef;
+use crate::cancel::CancelHandle;
+use crate::catalog::{TableDef, named};
 use crate::exec::filter::{Filter, Limit, Project};
 use crate::exec::operator::Operator;
 use crate::exec::scan::Scan;
-use crate::sql::ast::{CompareOp, Expr, Selection};
-use crate::store::btree::BTree;
+use crate::exec::sort::Sort;
+use crate::sql::ast::{CompareOp, Expr, OrderBy, Selection};
+use crate::store::btree::{BTree, Direction};
+use crate::store::extsort::{self, ExternalSort};
 use crate::store::page::FileId;
 use crate::store::pool::{BufferPool, Mark};
 
-/// The plan of a read: a scan, then the condition, then the count, then the
-/// columns asked for.
+/// What a read needs of its server: the pages, the file of its table, the
+/// mark its reads take, and where a sort may spill.
+pub struct Reading<'a> {
+    pub pool: &'a BufferPool,
+    pub file: FileId,
+    pub mark: Mark,
+    /// Where a sort writes its runs, and how much it holds before it does.
+    pub tmp: PathBuf,
+    pub sort_bytes: u64,
+    /// The flag that stops the statement, read between rows.
+    pub cancel: CancelHandle,
+}
+
+/// The plan of a read: a scan, then the condition, then the order, then the
+/// count, then the columns asked for.
+///
+/// The order sits under the count, because a count counts the rows of the
+/// order, and over the columns, because an order may name a column the
+/// selection leaves out.
 pub fn plan<'a>(
     table: &TableDef,
     selection: &Selection,
     condition: Option<&Expr>,
+    order: Option<&OrderBy>,
     limit: Option<u64>,
-    pool: &'a BufferPool,
-    file: FileId,
-    mark: Mark,
+    reading: &Reading<'a>,
 ) -> Result<Box<dyn Operator + 'a>, DbError> {
-    let tree = BTree::open(pool, file, table, mark);
-    let (from, to) = key_bounds(table, condition);
+    let sort = match order {
+        Some(order) => Some(sort_key(table, order)?),
+        None => None,
+    };
+    // An order on the primary key is the order the tree holds, so the scan
+    // reads it the way round that was asked for and nothing sorts.
+    let (key_order, direction) = match sort {
+        Some((key, descending)) if key == table.pk_index => (
+            true,
+            match descending {
+                true => Direction::Descending,
+                false => Direction::Ascending,
+            },
+        ),
+        _ => (false, Direction::Ascending),
+    };
+    let tree = BTree::open(reading.pool, reading.file, table, reading.mark);
     let mut plan: Box<dyn Operator + 'a> = Box::new(Scan::new(
         &tree,
-        pool,
-        file,
-        table.columns.clone(),
-        from,
-        to,
+        key_bounds(table, condition),
+        direction,
+        reading.cancel.clone(),
     )?);
     if let Some(condition) = condition {
         plan = Box::new(Filter::new(plan, condition.clone()));
+    }
+    if let Some((key, descending)) = sort.filter(|_| !key_order) {
+        plan = Box::new(Sort::new(
+            plan,
+            reading.cancel.clone(),
+            ExternalSort::new(
+                &reading.tmp,
+                table.columns.clone(),
+                key,
+                descending,
+                reading.sort_bytes,
+                extsort::FAN_IN,
+            )?,
+        ));
     }
     if let Some(rows) = limit {
         plan = Box::new(Limit::new(plan, rows));
     }
     Ok(Box::new(Project::new(plan, selection)?))
+}
+
+/// The column an order names, and whether it runs backwards.
+fn sort_key(table: &TableDef, order: &OrderBy) -> Result<(usize, bool), DbError> {
+    let key = table
+        .columns
+        .iter()
+        .position(|column| column.name == order.column)
+        .ok_or_else(|| {
+            named(
+                ErrorCode::UnknownColumn,
+                format!("no column named {}", order.column),
+            )
+        })?;
+    Ok((key, order.descending))
 }
 
 /// What the condition says about the primary key, as a range the tree can

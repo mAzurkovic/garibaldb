@@ -39,6 +39,8 @@ impl Dir {
                     // statements, which is the only way to see a checkpoint.
                     checkpoint: 256 * 1024,
                     lock_timeout: Duration::from_secs(5),
+                    // Small enough that a few rows spill a run.
+                    sort: 4 * 1024,
                 },
             )
             .expect("the data directory opens"),

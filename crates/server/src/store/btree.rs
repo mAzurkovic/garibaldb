@@ -42,6 +42,13 @@ pub struct BTree<'a> {
     mark: Mark,
 }
 
+/// Which way a walk of the tree runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Direction {
+    Ascending,
+    Descending,
+}
+
 /// The way down to one leaf.
 struct Path {
     leaf: u32,
@@ -58,6 +65,18 @@ impl<'a> BTree<'a> {
             key_index: table.pk_index,
             mark,
         }
+    }
+
+    pub fn pool(&self) -> &'a BufferPool {
+        self.pool
+    }
+
+    pub fn file(&self) -> FileId {
+        self.file
+    }
+
+    pub fn columns(&self) -> &[ColumnDef] {
+        &self.columns
     }
 
     /// A page of this tree, as of the mark it reads at.
@@ -144,19 +163,48 @@ impl<'a> BTree<'a> {
         Ok(Some(row))
     }
 
-    /// Every row from one bound to the other, in key order.
-    pub fn cursor(&self, from: Bound<Value>, to: Bound<Value>) -> Result<Cursor<'a>, DbError> {
+    /// Every row from one bound to the other, in key order or the reverse.
+    ///
+    /// A walk starts at the bound it is leaving and stops at the bound it is
+    /// heading for, so the same pair of bounds reads the same rows either way
+    /// round.
+    pub fn cursor(
+        &self,
+        from: Bound<Value>,
+        to: Bound<Value>,
+        direction: Direction,
+    ) -> Result<Cursor<'a>, DbError> {
         let root = self.root()?;
-        if root == 0 {
-            return Ok(Cursor {
+        let (limit, start) = match direction {
+            Direction::Ascending => (to, self.first(root, &from)?),
+            Direction::Descending => (from, self.last(root, &to)?),
+        };
+        Ok(match start {
+            Some((page_no, slot)) => Cursor {
+                tree: self.clone(),
+                page_no,
+                slot,
+                limit,
+                direction,
+                done: false,
+            },
+            None => Cursor {
                 tree: self.clone(),
                 page_no: 0,
                 slot: 0,
-                upper: to,
+                limit,
+                direction,
                 done: true,
-            });
+            },
+        })
+    }
+
+    /// Where an ascending walk starts: the first key at or after the bound.
+    fn first(&self, root: u32, from: &Bound<Value>) -> Result<Option<(u32, u16)>, DbError> {
+        if root == 0 {
+            return Ok(None);
         }
-        let (page_no, slot) = match &from {
+        Ok(Some(match from {
             Bound::Unbounded => (self.leftmost(root)?, 0),
             Bound::Included(key) | Bound::Excluded(key) => {
                 let leaf = self.descend(root, key)?.leaf;
@@ -166,14 +214,51 @@ impl<'a> BTree<'a> {
                 let skip = found && matches!(from, Bound::Excluded(_));
                 (leaf, slot + u16::from(skip))
             }
+        }))
+    }
+
+    /// Where a descending walk starts: the last key at or before the bound.
+    fn last(&self, root: u32, to: &Bound<Value>) -> Result<Option<(u32, u16)>, DbError> {
+        if root == 0 {
+            return Ok(None);
+        }
+        let (leaf, slot) = match to {
+            Bound::Unbounded => {
+                let leaf = self.rightmost(root)?;
+                (leaf, self.slots(leaf)?)
+            }
+            Bound::Included(key) | Bound::Excluded(key) => {
+                let leaf = self.descend(root, key)?.leaf;
+                let page = self.read(leaf)?;
+                let (slot, found) = self.search(page.bytes(), PageKind::Leaf, key)?;
+                // A search that found nothing gives the first key past the
+                // bound, and an excluded bound that is there is past it too.
+                (
+                    leaf,
+                    slot + u16::from(found && matches!(to, Bound::Included(_))),
+                )
+            }
         };
-        Ok(Cursor {
-            tree: self.clone(),
-            page_no,
-            slot,
-            upper: to,
-            done: false,
-        })
+        // One place back from there, which can be the leaf on the left.
+        match slot.checked_sub(1) {
+            Some(slot) => Ok(Some((leaf, slot))),
+            None => match self
+                .read(leaf)
+                .and_then(|page| PageHeader::read(page.bytes()))?
+                .prev
+            {
+                // The last record of that leaf. An empty one reads as none
+                // and the walk hops again.
+                0 => Ok(None),
+                left => Ok(Some((left, self.slots(left)?.saturating_sub(1)))),
+            },
+        }
+    }
+
+    /// How many records a leaf holds. A descending walk enters a leaf one
+    /// place past its last record and steps back.
+    fn slots(&self, page_no: u32) -> Result<u16, DbError> {
+        Ok(page::slot_count(self.read(page_no)?.bytes()))
     }
 
     /// The column the tree is keyed by, as a list of one.
@@ -317,6 +402,28 @@ impl<'a> BTree<'a> {
                     page_no = child;
                 }
             }
+        }
+    }
+
+    /// The rightmost leaf under a page.
+    fn rightmost(&self, page_no: u32) -> Result<u32, DbError> {
+        let mut page_no = page_no;
+        loop {
+            let child = {
+                let page = self.read(page_no)?;
+                let bytes = page.bytes();
+                match PageHeader::read(bytes)?.kind {
+                    PageKind::Leaf => return Ok(page_no),
+                    PageKind::Interior => {
+                        let last = page::slot_count(bytes) - 1;
+                        BTree::split_entry(record(bytes, last)?)?.1
+                    }
+                    other => {
+                        return Err(storage_error(format!("{other:?} is no part of a tree")));
+                    }
+                }
+            };
+            page_no = child;
         }
     }
 
@@ -501,7 +608,10 @@ pub struct Cursor<'a> {
     tree: BTree<'a>,
     page_no: u32,
     slot: u16,
-    upper: Bound<Value>,
+    /// The bound the walk is heading for, which is the upper one going up and
+    /// the lower one coming down.
+    limit: Bound<Value>,
+    direction: Direction,
     done: bool,
 }
 
@@ -509,40 +619,76 @@ impl Cursor<'_> {
     /// The next row, or none at the end of the range.
     pub fn next(&mut self) -> Result<Option<Vec<u8>>, DbError> {
         while !self.done {
-            let (row, next) = {
+            let (row, along) = {
                 let page = self.tree.read(self.page_no)?;
+                let header = PageHeader::read(page.bytes())?;
                 let row = page::slot(page.bytes(), self.slot).map(<[u8]>::to_vec);
-                (row, PageHeader::read(page.bytes())?.next)
+                (row, self.along(&header))
             };
             match row {
                 Some(row) => {
-                    self.slot += 1;
+                    self.step(along)?;
                     if self.beyond(&row)? {
                         self.done = true;
                         return Ok(None);
                     }
                     return Ok(Some(row));
                 }
-                // The leaf ran out, so the walk goes to the one on its right.
-                None => match next {
-                    0 => self.done = true,
-                    page_no => {
-                        self.page_no = page_no;
-                        self.slot = 0;
-                    }
-                },
+                // The leaf ran out, so the walk goes to the one beside it.
+                None => self.hop(along)?,
             }
         }
         Ok(None)
     }
 
-    /// Whether a row is past the upper bound.
+    /// The leaf beside this one in the direction of the walk.
+    fn along(&self, header: &PageHeader) -> u32 {
+        match self.direction {
+            Direction::Ascending => header.next,
+            Direction::Descending => header.prev,
+        }
+    }
+
+    /// Moves one record on. Off the edge of a leaf, that is the next leaf.
+    fn step(&mut self, along: u32) -> Result<(), DbError> {
+        match self.direction {
+            Direction::Ascending => self.slot += 1,
+            Direction::Descending => match self.slot.checked_sub(1) {
+                Some(slot) => self.slot = slot,
+                None => self.hop(along)?,
+            },
+        }
+        Ok(())
+    }
+
+    /// Steps onto the next leaf, at the record a walk in this direction reads
+    /// first. No leaf there is the end of the walk.
+    fn hop(&mut self, along: u32) -> Result<(), DbError> {
+        match along {
+            0 => self.done = true,
+            page_no => {
+                self.page_no = page_no;
+                self.slot = match self.direction {
+                    Direction::Ascending => 0,
+                    // A leaf that holds nothing reads as none and hops again.
+                    Direction::Descending => self.tree.slots(page_no)?.saturating_sub(1),
+                };
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a row is past the bound the walk is heading for.
     fn beyond(&self, row: &[u8]) -> Result<bool, DbError> {
         let key = self.tree.key_of(row)?;
-        Ok(match &self.upper {
+        let past = match self.direction {
+            Direction::Ascending => Ordering::Greater,
+            Direction::Descending => Ordering::Less,
+        };
+        Ok(match &self.limit {
             Bound::Unbounded => false,
-            Bound::Included(limit) => compare(&key, limit)? == Ordering::Greater,
-            Bound::Excluded(limit) => compare(&key, limit)? != Ordering::Less,
+            Bound::Included(limit) => compare(&key, limit)? == past,
+            Bound::Excluded(limit) => compare(&key, limit)? != past.reverse(),
         })
     }
 }
@@ -682,7 +828,12 @@ mod tests {
     }
 
     fn scan(tree: &BTree, from: Bound<Value>, to: Bound<Value>) -> Vec<i64> {
-        let mut cursor = tree.cursor(from, to).expect("the cursor opens");
+        walk(tree, from, to, Direction::Ascending)
+    }
+
+    /// Every key a walk gives, from one bound to the other.
+    fn walk(tree: &BTree, from: Bound<Value>, to: Bound<Value>, direction: Direction) -> Vec<i64> {
+        let mut cursor = tree.cursor(from, to, direction).expect("the cursor opens");
         let mut found = Vec::new();
         while let Some(row) = cursor.next().expect("the scan reads") {
             match tree.key_of(&row).expect("the row holds a key") {
@@ -951,7 +1102,9 @@ mod tests {
         for key in [1, 2, 3] {
             tree.insert(&wide_row(&table, key)).unwrap();
         }
-        let mut cursor = tree.cursor(Bound::Unbounded, Bound::Unbounded).unwrap();
+        let mut cursor = tree
+            .cursor(Bound::Unbounded, Bound::Unbounded, Direction::Ascending)
+            .unwrap();
         let mut found = Vec::new();
         while let Some(row) = cursor.next().unwrap() {
             found.push(tree.key_of(&row).unwrap());
@@ -1011,6 +1164,124 @@ mod tests {
             scan(&tree, Bound::Included(at(5)), Bound::Included(at(4))),
             Vec::<i64>::new()
         );
+    }
+
+    #[test]
+    fn a_walk_the_other_way_gives_the_keys_in_reverse() {
+        let (_dir, pool, _wal, file) = fixture("descending", 8);
+        let table = table(DataType::Integer);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
+        // Enough rows for several leaves, so the walk crosses them.
+        for key in 0..600 {
+            tree.insert(&int_row(&table, key)).unwrap();
+        }
+
+        let down = walk(
+            &tree,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            Direction::Descending,
+        );
+        assert_eq!(down, (0..600).rev().collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn a_walk_down_from_the_first_key_of_a_leaf_steps_into_the_one_before() {
+        let (_dir, pool, _wal, file) = fixture("descending-edges", 8);
+        let table = table(DataType::Integer);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
+        for key in 0..600 {
+            tree.insert(&int_row(&table, key)).unwrap();
+        }
+
+        // One of these bounds is the first key of a leaf, wherever the splits
+        // fell, so the walk has to start in the leaf on its left.
+        for key in 1..600 {
+            let down = walk(
+                &tree,
+                Bound::Unbounded,
+                Bound::Excluded(Value::Integer(key)),
+                Direction::Descending,
+            );
+            assert_eq!(down.first(), Some(&(key - 1)), "down from {key}");
+        }
+
+        // Below every key there is nothing to step back to.
+        assert!(
+            walk(
+                &tree,
+                Bound::Unbounded,
+                Bound::Excluded(Value::Integer(0)),
+                Direction::Descending,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_walk_either_way_reads_the_same_range() {
+        let (_dir, pool, _wal, file) = fixture("ranges-both-ways", 8);
+        let table = table(DataType::Integer);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
+        for key in 0..200 {
+            tree.insert(&int_row(&table, key)).unwrap();
+        }
+
+        let bounds = [
+            (
+                Bound::Included(Value::Integer(50)),
+                Bound::Included(Value::Integer(60)),
+            ),
+            (
+                Bound::Excluded(Value::Integer(50)),
+                Bound::Excluded(Value::Integer(60)),
+            ),
+            (Bound::Included(Value::Integer(50)), Bound::Unbounded),
+            (Bound::Unbounded, Bound::Excluded(Value::Integer(7))),
+            // Bounds that no key sits on, and a range that holds nothing.
+            (
+                Bound::Included(Value::Integer(-5)),
+                Bound::Included(Value::Integer(3)),
+            ),
+            (
+                Bound::Included(Value::Integer(80)),
+                Bound::Included(Value::Integer(80)),
+            ),
+            (
+                Bound::Excluded(Value::Integer(80)),
+                Bound::Excluded(Value::Integer(81)),
+            ),
+            (Bound::Included(Value::Integer(300)), Bound::Unbounded),
+        ];
+        for (from, to) in bounds {
+            let up = walk(&tree, from.clone(), to.clone(), Direction::Ascending);
+            let mut down = walk(&tree, from.clone(), to.clone(), Direction::Descending);
+            down.reverse();
+            assert_eq!(up, down, "{from:?} to {to:?}");
+        }
+    }
+
+    #[test]
+    fn a_walk_the_other_way_over_little_or_nothing() {
+        let (_dir, pool, _wal, file) = fixture("descending-small", 8);
+        let table = table(DataType::Integer);
+        let tree = BTree::open(&pool, file, &table, Mark::Latest);
+        let down = |tree: &BTree| {
+            walk(
+                tree,
+                Bound::Unbounded,
+                Bound::Unbounded,
+                Direction::Descending,
+            )
+        };
+
+        assert_eq!(down(&tree), Vec::<i64>::new(), "a tree of nothing");
+        tree.insert(&int_row(&table, 1)).unwrap();
+        assert_eq!(down(&tree), vec![1], "one row on one page");
+        tree.insert(&int_row(&table, 2)).unwrap();
+        assert_eq!(down(&tree), vec![2, 1]);
+        tree.delete(&Value::Integer(2)).unwrap();
+        assert_eq!(down(&tree), vec![1]);
     }
 
     #[test]
@@ -1179,7 +1450,7 @@ mod tests {
         let e = tree.get(&Value::Integer(1)).err().unwrap();
         assert!(e.message.contains("no part of a tree"), "{e}");
         let e = tree
-            .cursor(Bound::Unbounded, Bound::Unbounded)
+            .cursor(Bound::Unbounded, Bound::Unbounded, Direction::Ascending)
             .err()
             .unwrap();
         assert!(e.message.contains("no part of a tree"), "{e}");

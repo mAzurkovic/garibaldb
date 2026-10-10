@@ -18,6 +18,11 @@ const DEFAULT_WAL_MAX_BYTES: u64 = 8 * GIB;
 /// statement can be held up by one.
 const DEFAULT_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// How many bytes of rows one sort holds in memory before it spills a run to
+/// `tmp/`. [NFR13] allows a connection 10 MB, and a sort is the one thing
+/// that borrows it.
+const DEFAULT_SORT_BYTES: u64 = 10 * 1024 * 1024;
+
 /// The connection count that [NFR14] asks for.
 const DEFAULT_MAX_CONNECTIONS: usize = 100;
 
@@ -34,6 +39,8 @@ pub struct Config {
     /// The WAL size in bytes at which a checkpoint empties it into the table
     /// files.
     pub checkpoint_bytes: u64,
+    /// The bytes of rows one sort holds before it spills to `tmp/`.
+    pub sort_bytes: u64,
     /// The wait in milliseconds after which a lock fails with `LOCK_TIMEOUT`.
     pub lock_timeout_ms: u64,
     /// The connection count that the server accepts. See [NFR14].
@@ -48,6 +55,7 @@ impl Default for Config {
             mem_limit: DEFAULT_MEM_LIMIT,
             wal_max_bytes: DEFAULT_WAL_MAX_BYTES,
             checkpoint_bytes: DEFAULT_CHECKPOINT_BYTES,
+            sort_bytes: DEFAULT_SORT_BYTES,
             lock_timeout_ms: 5000,
             max_connections: DEFAULT_MAX_CONNECTIONS,
         }
@@ -72,6 +80,7 @@ impl Config {
                 "--max-connections" => config.max_connections = number(&flag, flags.next())?,
                 "--lock-timeout-ms" => config.lock_timeout_ms = number(&flag, flags.next())?,
                 "--checkpoint-bytes" => config.checkpoint_bytes = number(&flag, flags.next())?,
+                "--sort-bytes" => config.sort_bytes = number(&flag, flags.next())?,
                 _ => return Err(format!("unknown flag `{flag}`")),
             }
         }
@@ -105,6 +114,7 @@ mod tests {
         assert_eq!(c.mem_limit, 1024 * 1024 * 1024);
         assert_eq!(c.wal_max_bytes, 8 * 1024 * 1024 * 1024);
         assert_eq!(c.checkpoint_bytes, 64 * 1024 * 1024);
+        assert_eq!(c.sort_bytes, 10 * 1024 * 1024);
         assert_eq!(c.lock_timeout_ms, 5000);
         assert_eq!(c.max_connections, 100);
     }
@@ -154,6 +164,12 @@ mod tests {
             (c.port, c.data_dir, c.max_connections, c.lock_timeout_ms),
             (6000, PathBuf::from("/tmp/db"), 7, 250)
         );
+    }
+
+    #[test]
+    fn the_sort_size_takes_the_next_argument() {
+        assert_eq!(parse(&["--sort-bytes", "8192"]).unwrap().sort_bytes, 8192);
+        assert!(parse(&["--sort-bytes", "lots"]).is_err());
     }
 
     #[test]

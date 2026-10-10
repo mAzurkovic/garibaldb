@@ -10,6 +10,7 @@
 
 pub mod btree;
 pub mod codec;
+pub mod extsort;
 pub mod overflow;
 pub mod page;
 pub mod pool;

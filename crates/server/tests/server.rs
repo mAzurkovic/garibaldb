@@ -466,3 +466,115 @@ fn ready_carries_the_transaction_state() {
     );
     assert_eq!(state(&conn.run("ROLLBACK")), TxState::None);
 }
+
+/// Every value of one text column, in the order the rows arrived.
+fn labels(answer: &[ServerMsg]) -> Vec<String> {
+    answer
+        .iter()
+        .filter_map(|msg| match msg {
+            ServerMsg::DataRow { values } => match values.first() {
+                Some(protocol::Value::Text(label)) => Some(label.clone()),
+                other => panic!("expected text, got {other:?}"),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// One statement that writes many rows, which is cheaper than many
+/// statements and gives a sort something to do.
+fn bulk(rows: i64) -> String {
+    let values: Vec<String> = (0..rows)
+        .map(|id| format!("({id}, 'label of row {:05}')", (id * 7919) % rows))
+        .collect();
+    format!("INSERT INTO item (id, label) VALUES {}", values.join(", "))
+}
+
+/// An order on a column that is not the key, over more rows than the sort
+/// holds in memory, so it spills to `tmp/` and merges.
+#[test]
+fn an_order_larger_than_the_sort_budget_comes_back_in_order() {
+    const ROWS: i64 = 1200;
+    let data = DataDir::new("order-spill");
+    let server = Server::start_on(&data.0, &["--sort-bytes", "4096"]);
+    let mut conn = server.connect();
+    conn.start_up();
+    conn.run("CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL)");
+    conn.run(&bulk(ROWS));
+
+    let answer = conn.run("SELECT label FROM item ORDER BY label");
+    let got = labels(&answer);
+    let mut want = got.clone();
+    want.sort();
+
+    assert_eq!(got.len(), ROWS as usize);
+    assert_eq!(got, want);
+    assert_eq!(sort_files(&data.0), 0, "the runs went with the statement");
+}
+
+/// How many files sit under the sort directory of the starting database.
+fn sort_files(data_dir: &std::path::Path) -> usize {
+    std::fs::read_dir(data_dir.join(h1::DATABASE).join("tmp"))
+        .map(|read| read.count())
+        .unwrap_or(0)
+}
+
+/// A client stops a statement from a second connection. The statement ends
+/// with its own code and the connection carries the next one.
+#[test]
+fn a_cancel_stops_a_statement_and_leaves_the_connection_open() {
+    const ROWS: i64 = 4000;
+    let data = DataDir::new("cancel-socket");
+    let server = Server::start_on(&data.0, &[]);
+    let mut conn = server.connect();
+    let (conn_id, secret) = conn.start_up();
+    conn.run("CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL)");
+    conn.run(&bulk(ROWS));
+
+    // Asked for and left unread, so the server fills the socket and blocks
+    // part way through writing the rows. The statement is certainly still
+    // running when the cancel lands.
+    conn.send(&ClientMsg::Query {
+        sql: "SELECT label FROM item".to_string(),
+    });
+    let mut canceller = server.connect();
+    canceller.send(&ClientMsg::Cancel {
+        conn_id,
+        secret: secret.clone(),
+    });
+    drop(canceller);
+
+    let mut rows = 0;
+    let code = loop {
+        match conn.expect() {
+            ServerMsg::DataRow { .. } => rows += 1,
+            ServerMsg::Error { code, .. } => break Some(code),
+            ServerMsg::Complete { .. } => break None,
+            _ => {}
+        }
+    };
+    assert_eq!(code, Some(ErrorCode::Cancelled));
+    assert!(rows > 0, "it had started writing rows");
+    assert!(rows < ROWS, "and it did not finish");
+
+    // The ready that closes the cancelled statement, then the next one runs.
+    assert!(matches!(conn.expect(), ServerMsg::Ready { .. }));
+    assert_eq!(ids(&conn.run("SELECT id FROM item WHERE id = 1")), vec![1]);
+}
+
+/// A run file that a crash left behind is gone after a start.
+#[test]
+fn a_start_clears_the_sort_files() {
+    let data = DataDir::new("tmp-cleared");
+    let first = Server::start_on(&data.0, &[]);
+    drop(first);
+
+    let tmp = data.0.join(h1::DATABASE).join("tmp");
+    std::fs::create_dir_all(tmp.join("17-0")).expect("the sort directory is made");
+    std::fs::write(tmp.join("17-0").join("0.run"), b"a run no one owns").expect("the run writes");
+
+    let second = Server::start_on(&data.0, &[]);
+    let mut conn = second.connect();
+    conn.start_up();
+    assert_eq!(sort_files(&data.0), 0);
+}

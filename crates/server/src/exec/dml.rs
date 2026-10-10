@@ -13,12 +13,14 @@ use std::sync::Arc;
 
 use protocol::{DataType, DbError, ErrorCode, Value};
 
+use crate::cancel::CancelHandle;
 use crate::catalog::registry::Registry;
 use crate::catalog::{ColumnDef, Database, TableDef, ddl, named};
 use crate::exec::operator::Operator;
+use crate::exec::planner::Reading;
 use crate::exec::{eval, planner};
-use crate::sql::ast::{Assignment, Expr, Selection, Statement};
-use crate::store::btree::BTree;
+use crate::sql::ast::{Assignment, Expr, Statement};
+use crate::store::btree::{BTree, Direction};
 use crate::store::page::FileId;
 use crate::store::pool::{BufferPool, Mark};
 use crate::store::row::{self, Row};
@@ -61,14 +63,15 @@ pub fn run<'a>(
     db: &Arc<Database>,
     registry: &'a Registry,
     txn: &mut Option<Transaction>,
+    cancel: &CancelHandle,
 ) -> Result<Answer<'a>, DbError> {
     match statement {
         Statement::Begin { read_only } => begin(db, registry, txn, *read_only),
         Statement::Commit => finish(db, registry, txn, Ending::Commit),
         Statement::Rollback => finish(db, registry, txn, Ending::Rollback),
         _ => match txn.as_mut() {
-            Some(open) => inside(statement, db, registry, open),
-            None => alone(statement, db, registry),
+            Some(open) => inside(statement, db, registry, open, cancel),
+            None => alone(statement, db, registry, cancel),
         },
     }
 }
@@ -144,6 +147,7 @@ fn inside<'a>(
     db: &Database,
     registry: &'a Registry,
     open: &mut Transaction,
+    cancel: &CancelHandle,
 ) -> Result<Answer<'a>, DbError> {
     if open.is_aborted() {
         return Err(aborted());
@@ -153,13 +157,14 @@ fn inside<'a>(
             ErrorCode::SchemaChangeInTxn,
             "a schema change cannot run inside a transaction",
         )),
-        Does::Read => dispatch(statement, db, registry, open.mark(), None),
+        Does::Read => dispatch(statement, db, registry, open.mark(), None, cancel),
         Does::Change => {
             open.check_writable()?;
             // A change that failed partway left pages in the pool that no
             // commit may settle, so the transaction ends here and the client
             // has to roll back.
-            dispatch(statement, db, registry, open.mark(), None).inspect_err(|_| open.abort())
+            dispatch(statement, db, registry, open.mark(), None, cancel)
+                .inspect_err(|_| open.abort())
         }
     }
 }
@@ -169,15 +174,16 @@ fn alone<'a>(
     statement: &Statement,
     db: &Arc<Database>,
     registry: &'a Registry,
+    cancel: &CancelHandle,
 ) -> Result<Answer<'a>, DbError> {
     match does(statement) {
         // A schema change is written by an atomic rename, not through the
         // log, so it takes no lock.
-        Does::Schema => dispatch(statement, db, registry, Mark::Latest, None),
+        Does::Schema => dispatch(statement, db, registry, Mark::Latest, None, cancel),
         Does::Change => {
             let txn = db.begin(TxnKind::ReadWrite, registry.limits().lock_timeout)?;
             let pool = registry.pool();
-            match dispatch(statement, db, registry, Mark::Latest, None) {
+            match dispatch(statement, db, registry, Mark::Latest, None, cancel) {
                 Ok(answer) => {
                     txn.commit(pool, db)?;
                     settle(registry, db)?;
@@ -194,7 +200,7 @@ fn alone<'a>(
         Does::Read => {
             let mark = db.wal.committed();
             let lease = Some(db.readers.lease(mark));
-            dispatch(statement, db, registry, Mark::At(mark), lease)
+            dispatch(statement, db, registry, Mark::At(mark), lease, cancel)
         }
     }
 }
@@ -238,6 +244,7 @@ fn dispatch<'a>(
     registry: &'a Registry,
     mark: Mark,
     lease: Option<Lease>,
+    cancel: &CancelHandle,
 ) -> Result<Answer<'a>, DbError> {
     match statement {
         Statement::CreateDatabase { name } => {
@@ -283,22 +290,24 @@ fn dispatch<'a>(
             order_by,
             limit,
         } => {
-            if order_by.is_some() {
-                return Err(named(
-                    ErrorCode::SyntaxError,
-                    "ORDER BY is not supported yet",
-                ));
-            }
-            select(
-                db,
-                registry,
-                table,
+            let table = table_of(db, table)?;
+            let reading = Reading {
+                pool: registry.pool(),
+                file: registry.table_file(db, &table)?,
+                mark,
+                tmp: registry.sort_dir(db),
+                sort_bytes: registry.limits().sort,
+                cancel: cancel.clone(),
+            };
+            let plan = planner::plan(
+                &table,
                 selection,
                 filter.as_ref(),
+                order_by.as_ref(),
                 *limit,
-                mark,
-            )
-            .map(|plan| Answer::Rows {
+                &reading,
+            )?;
+            Ok(Answer::Rows {
                 plan,
                 _snapshot: lease,
             })
@@ -377,29 +386,6 @@ fn insert(
         tree.insert(&bytes)?;
     }
     Ok(rows.len() as u64)
-}
-
-/// The plan of a read.
-fn select<'a>(
-    db: &Database,
-    registry: &'a Registry,
-    name: &str,
-    selection: &Selection,
-    condition: Option<&Expr>,
-    limit: Option<u64>,
-    mark: Mark,
-) -> Result<Box<dyn Operator + 'a>, DbError> {
-    let table = table_of(db, name)?;
-    let file = registry.table_file(db, &table)?;
-    planner::plan(
-        &table,
-        selection,
-        condition,
-        limit,
-        registry.pool(),
-        file,
-        mark,
-    )
 }
 
 /// Changes every row the condition takes.
@@ -484,7 +470,7 @@ fn next_match(
         None => Bound::Unbounded,
         Some(key) => Bound::Excluded(key.clone()),
     };
-    let mut cursor = tree.cursor(from, Bound::Unbounded)?;
+    let mut cursor = tree.cursor(from, Bound::Unbounded, Direction::Ascending)?;
     while let Some(bytes) = cursor.next()? {
         let row = row::load(pool, file, &table.columns, &bytes)?;
         let takes = match condition {
@@ -596,6 +582,7 @@ fn duplicate() -> DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancel::CancelHandle;
     use crate::catalog::registry::Connected;
     use crate::catalog::testing::Dir;
     use crate::sql::parser;
@@ -610,7 +597,13 @@ mod tests {
     /// Runs a statement and returns its rows, which a write leaves empty.
     fn rows(sql: &str, held: &Connected, registry: &Registry) -> Result<Vec<Row>, DbError> {
         let statement = parser::parse(sql).expect("the statement parses");
-        match run(&statement, &held.db, registry, &mut None)? {
+        match run(
+            &statement,
+            &held.db,
+            registry,
+            &mut None,
+            &CancelHandle::new(),
+        )? {
             Answer::Changed { .. } => Ok(Vec::new()),
             Answer::Rows { mut plan, .. } => {
                 let mut found = Vec::new();
@@ -636,7 +629,7 @@ mod tests {
         txn: &mut Option<Transaction>,
     ) -> Result<u64, DbError> {
         let statement = parser::parse(sql).expect("the statement parses");
-        match run(&statement, &held.db, registry, txn)? {
+        match run(&statement, &held.db, registry, txn, &CancelHandle::new())? {
             Answer::Changed { rows, .. } => Ok(rows),
             Answer::Rows { mut plan, .. } => {
                 let mut rows = 0;
@@ -688,9 +681,14 @@ mod tests {
             ("DROP TABLE t", "DROP TABLE"),
         ] {
             let statement = parser::parse(sql).unwrap();
-            let Answer::Changed { kind: got, rows } =
-                run(&statement, &held.db, &registry, &mut None).unwrap()
-            else {
+            let Answer::Changed { kind: got, rows } = run(
+                &statement,
+                &held.db,
+                &registry,
+                &mut None,
+                &CancelHandle::new(),
+            )
+            .unwrap() else {
                 panic!("{sql} reads rows");
             };
             assert_eq!((got, rows), (kind, 0), "{sql}");
@@ -1018,15 +1016,237 @@ mod tests {
         assert!(shown("SELECT id FROM note", &held, &registry).is_empty());
     }
 
+    /// Rows of a sorted table, each written as its values joined by a space.
+    /// A few rows of nonsense order, so a sort has work to do.
+    fn stocked(held: &Connected, registry: &Registry) {
+        item(held, registry);
+        for (id, label, price) in [
+            (3, "plum", "0.75"),
+            (1, "apple", "1.50"),
+            (4, "fig", "2.25"),
+            (2, "pear", "1.5"),
+        ] {
+            changed(
+                &format!("INSERT INTO item (id, label, price) VALUES ({id}, '{label}', {price})"),
+                held,
+                registry,
+            )
+            .unwrap();
+        }
+    }
+
+    /// The files under the sort directory of a database.
+    fn sort_files(registry: &Registry, held: &Connected) -> usize {
+        std::fs::read_dir(registry.sort_dir(&held.db))
+            .map(|read| read.count())
+            .unwrap_or(0)
+    }
+
     #[test]
-    fn sorting_waits_for_the_sort_that_can_do_it() {
-        let (_dir, registry, held) = shop("order-by");
+    fn an_order_on_the_primary_key_needs_no_sort() {
+        let (_dir, registry, held) = shop("order-by-key");
+        stocked(&held, &registry);
+
+        assert_eq!(
+            shown("SELECT id FROM item ORDER BY id", &held, &registry),
+            ["1", "2", "3", "4"]
+        );
+        assert_eq!(
+            shown("SELECT id FROM item ORDER BY id DESC", &held, &registry),
+            ["4", "3", "2", "1"]
+        );
+        assert_eq!(
+            sort_files(&registry, &held),
+            0,
+            "the tree holds that order already"
+        );
+    }
+
+    #[test]
+    fn an_order_on_another_column_sorts() {
+        let (_dir, registry, held) = shop("order-by-column");
+        stocked(&held, &registry);
+
+        assert_eq!(
+            shown("SELECT label FROM item ORDER BY label", &held, &registry),
+            ["apple", "fig", "pear", "plum"]
+        );
+        assert_eq!(
+            shown(
+                "SELECT label FROM item ORDER BY label DESC",
+                &held,
+                &registry
+            ),
+            ["plum", "pear", "fig", "apple"]
+        );
+        // A decimal by its value, so 1.5 and 1.50 fall together.
+        assert_eq!(
+            shown("SELECT id FROM item ORDER BY price", &held, &registry).len(),
+            4
+        );
+        assert_eq!(
+            sort_files(&registry, &held),
+            0,
+            "the runs went with the statement"
+        );
+    }
+
+    #[test]
+    fn an_order_can_name_a_column_the_selection_leaves_out() {
+        let (_dir, registry, held) = shop("order-by-hidden");
+        stocked(&held, &registry);
+        assert_eq!(
+            shown("SELECT id FROM item ORDER BY label", &held, &registry),
+            ["1", "4", "2", "3"]
+        );
+    }
+
+    #[test]
+    fn a_limit_takes_the_first_rows_of_the_order() {
+        let (_dir, registry, held) = shop("order-by-limit");
+        stocked(&held, &registry);
+        assert_eq!(
+            shown(
+                "SELECT label FROM item ORDER BY label LIMIT 2",
+                &held,
+                &registry
+            ),
+            ["apple", "fig"]
+        );
+        assert_eq!(
+            shown(
+                "SELECT id FROM item ORDER BY id DESC LIMIT 2",
+                &held,
+                &registry
+            ),
+            ["4", "3"]
+        );
+    }
+
+    /// Plans a read with a flag of its own, and hands back both.
+    fn planned<'a>(
+        sql: &str,
+        held: &Connected,
+        registry: &'a Registry,
+        cancel: &CancelHandle,
+    ) -> Box<dyn Operator + 'a> {
+        let statement = parser::parse(sql).expect("the statement parses");
+        let answer = run(&statement, &held.db, registry, &mut None, cancel).expect("it plans");
+        match answer {
+            Answer::Rows { plan, .. } => plan,
+            Answer::Changed { .. } => panic!("{sql} changes rows"),
+        }
+    }
+
+    #[test]
+    fn a_cancel_stops_a_scan_where_it_stands() {
+        let (_dir, registry, held) = shop("cancel-scan");
+        stocked(&held, &registry);
+        let cancel = CancelHandle::new();
+        let mut plan = planned("SELECT id FROM item", &held, &registry, &cancel);
+
+        assert!(plan.next().unwrap().is_some());
+        cancel.stop();
+
+        for _ in 0..2 {
+            let e = plan.next().expect_err("the flag is still set");
+            assert_eq!(e.code, ErrorCode::Cancelled);
+        }
+    }
+
+    #[test]
+    fn a_cancel_stops_a_sort_before_it_hands_back_a_row() {
+        let (_dir, registry, held) = shop("cancel-sort");
+        stocked(&held, &registry);
+        let cancel = CancelHandle::new();
+        // Nothing is read first, so the cancel lands while the sort fills.
+        let mut plan = planned(
+            "SELECT id FROM item ORDER BY label",
+            &held,
+            &registry,
+            &cancel,
+        );
+        cancel.stop();
+
+        let e = plan.next().expect_err("the cancel stops it");
+        assert_eq!(e.code, ErrorCode::Cancelled);
+        assert_eq!(sort_files(&registry, &held), 0, "the runs went with it");
+        // A sort that failed part way gave up its state, so it reports the
+        // end rather than carrying on.
+        cancel.clear();
+        assert_eq!(plan.next().expect("the sort is done"), None);
+    }
+
+    #[test]
+    fn an_order_on_a_column_that_is_not_there_is_an_error() {
+        let (_dir, registry, held) = shop("order-by-unknown");
         item(&held, &registry);
-        let e = rows("SELECT id FROM item ORDER BY label", &held, &registry)
+        let e = rows("SELECT id FROM item ORDER BY colour", &held, &registry)
             .err()
             .unwrap();
-        assert_eq!(e.code, ErrorCode::SyntaxError);
-        assert!(e.message.contains("not supported yet"), "{e}");
+        assert_eq!(e.code, ErrorCode::UnknownColumn);
+        assert!(e.message.contains("colour"), "{e}");
+    }
+
+    #[test]
+    fn a_null_sorts_last_and_a_condition_runs_before_the_order() {
+        let (_dir, registry, held) = shop("order-by-nulls");
+        item(&held, &registry);
+        for (id, label, price) in [
+            (1, "apple", "2.00"),
+            (2, "pear", "NULL"),
+            (3, "fig", "1.00"),
+        ] {
+            changed(
+                &format!("INSERT INTO item (id, label, price) VALUES ({id}, '{label}', {price})"),
+                &held,
+                &registry,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            shown("SELECT id FROM item ORDER BY price", &held, &registry),
+            ["3", "1", "2"]
+        );
+        assert_eq!(
+            shown("SELECT id FROM item ORDER BY price DESC", &held, &registry),
+            ["2", "1", "3"]
+        );
+        assert_eq!(
+            shown(
+                "SELECT id FROM item WHERE id != 1 ORDER BY label",
+                &held,
+                &registry
+            ),
+            ["3", "2"],
+            "the condition takes its rows out before the order"
+        );
+    }
+
+    #[test]
+    fn an_order_of_more_rows_than_the_budget_holds_spills_and_comes_back_in_order() {
+        let (_dir, registry, held) = shop("order-by-spill");
+        item(&held, &registry);
+        // A few hundred rows against a budget of a few kilobytes, so the sort
+        // writes runs and merges them.
+        const ROWS: i64 = 300;
+        for id in 0..ROWS {
+            let label = format!("label of row {:04}", (id * 7919) % ROWS);
+            changed(
+                &format!("INSERT INTO item (id, label) VALUES ({id}, '{label}')"),
+                &held,
+                &registry,
+            )
+            .unwrap();
+        }
+
+        let order = shown("SELECT label FROM item ORDER BY label", &held, &registry);
+        let mut want = order.clone();
+        want.sort();
+        assert_eq!(order, want);
+        assert_eq!(order.len(), ROWS as usize);
+        assert_eq!(sort_files(&registry, &held), 0, "tmp is empty again");
     }
 
     /// A database whose log takes every write and settles none of them,
@@ -1072,9 +1292,16 @@ mod tests {
         let (_dir, registry, held) = shop("dispatch-guard");
         for sql in ["BEGIN", "BEGIN READ ONLY", "COMMIT", "ROLLBACK"] {
             let statement = parser::parse(sql).unwrap();
-            let e = dispatch(&statement, &held.db, &registry, Mark::Latest, None)
-                .err()
-                .unwrap();
+            let e = dispatch(
+                &statement,
+                &held.db,
+                &registry,
+                Mark::Latest,
+                None,
+                &CancelHandle::new(),
+            )
+            .err()
+            .unwrap();
             assert_eq!(e.code, ErrorCode::SyntaxError, "{sql}");
             assert!(e.message.contains("runs on the connection"), "{e}");
         }
@@ -1264,7 +1491,14 @@ mod tests {
         .unwrap();
 
         let statement = parser::parse("SELECT * FROM item").unwrap();
-        let answer = run(&statement, &held.db, &registry, &mut None).unwrap();
+        let answer = run(
+            &statement,
+            &held.db,
+            &registry,
+            &mut None,
+            &CancelHandle::new(),
+        )
+        .unwrap();
         assert_eq!(
             held.db.readers.oldest(),
             Some(held.db.wal.committed()),
@@ -1279,16 +1513,28 @@ mod tests {
         let (_dir, registry, held) = shop("schema");
         item(&held, &registry);
         let statement = parser::parse("SELECT label, id FROM item").unwrap();
-        let Answer::Rows { plan, .. } = run(&statement, &held.db, &registry, &mut None).unwrap()
-        else {
+        let Answer::Rows { plan, .. } = run(
+            &statement,
+            &held.db,
+            &registry,
+            &mut None,
+            &CancelHandle::new(),
+        )
+        .unwrap() else {
             panic!("expected rows");
         };
         let names: Vec<&str> = plan.schema().iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["label", "id"]);
 
         let statement = parser::parse("SELECT * FROM item").unwrap();
-        let Answer::Rows { plan, .. } = run(&statement, &held.db, &registry, &mut None).unwrap()
-        else {
+        let Answer::Rows { plan, .. } = run(
+            &statement,
+            &held.db,
+            &registry,
+            &mut None,
+            &CancelHandle::new(),
+        )
+        .unwrap() else {
             panic!("expected rows");
         };
         let names: Vec<&str> = plan.schema().iter().map(|c| c.name.as_str()).collect();

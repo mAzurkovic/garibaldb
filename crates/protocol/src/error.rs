@@ -25,6 +25,8 @@ pub enum ErrorCode {
     TxnAlreadyOpen,
     SchemaChangeInTxn,
     LockTimeout,
+    /// A statement that a client stopped while it ran.
+    Cancelled,
     TooManyConnections,
     DatabaseExists,
     TableExists,
@@ -35,7 +37,7 @@ pub enum ErrorCode {
 impl ErrorCode {
     /// Every code. A name reads back through this, so a new code needs no
     /// second table anywhere.
-    pub const ALL: [ErrorCode; 17] = [
+    pub const ALL: [ErrorCode; 18] = [
         ErrorCode::SyntaxError,
         ErrorCode::UnknownTable,
         ErrorCode::UnknownColumn,
@@ -48,6 +50,7 @@ impl ErrorCode {
         ErrorCode::TxnAlreadyOpen,
         ErrorCode::SchemaChangeInTxn,
         ErrorCode::LockTimeout,
+        ErrorCode::Cancelled,
         ErrorCode::TooManyConnections,
         ErrorCode::DatabaseExists,
         ErrorCode::TableExists,
@@ -70,6 +73,7 @@ impl ErrorCode {
             ErrorCode::TxnAlreadyOpen => "TXN_ALREADY_OPEN",
             ErrorCode::SchemaChangeInTxn => "SCHEMA_CHANGE_IN_TXN",
             ErrorCode::LockTimeout => "LOCK_TIMEOUT",
+            ErrorCode::Cancelled => "CANCELLED",
             ErrorCode::TooManyConnections => "TOO_MANY_CONNECTIONS",
             ErrorCode::DatabaseExists => "DATABASE_EXISTS",
             ErrorCode::TableExists => "TABLE_EXISTS",
@@ -123,7 +127,7 @@ impl std::error::Error for DbError {}
 mod tests {
     use super::*;
 
-    const NAMES: [(ErrorCode, &str); 17] = [
+    const NAMES: [(ErrorCode, &str); 18] = [
         (ErrorCode::SyntaxError, "SYNTAX_ERROR"),
         (ErrorCode::UnknownTable, "UNKNOWN_TABLE"),
         (ErrorCode::UnknownColumn, "UNKNOWN_COLUMN"),
@@ -136,6 +140,7 @@ mod tests {
         (ErrorCode::TxnAlreadyOpen, "TXN_ALREADY_OPEN"),
         (ErrorCode::SchemaChangeInTxn, "SCHEMA_CHANGE_IN_TXN"),
         (ErrorCode::LockTimeout, "LOCK_TIMEOUT"),
+        (ErrorCode::Cancelled, "CANCELLED"),
         (ErrorCode::TooManyConnections, "TOO_MANY_CONNECTIONS"),
         (ErrorCode::DatabaseExists, "DATABASE_EXISTS"),
         (ErrorCode::TableExists, "TABLE_EXISTS"),

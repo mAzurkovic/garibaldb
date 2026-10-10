@@ -14,6 +14,10 @@ use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use protocol::{DbError, ErrorCode};
+
+use crate::catalog::named;
+
 /// The cancel flag of one connection. A clone points at the same flag.
 #[derive(Debug, Clone, Default)]
 pub struct CancelHandle {
@@ -32,12 +36,25 @@ impl CancelHandle {
     }
 
     /// Reads the flag. `SeqCst` for the same reason as `stop`.
-    ///
-    /// The operators read this between rows in milestone 11. Nothing calls it
-    /// before then.
-    #[allow(dead_code)]
     pub fn stopped(&self) -> bool {
         self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Clears the flag, which the session does before each statement so one
+    /// cancel stops one statement.
+    pub fn clear(&self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+
+    /// Fails when the connection has been asked to stop.
+    ///
+    /// The operators call this between rows, which is as often as a statement
+    /// can stop: nothing below them waits for longer than one page read.
+    pub fn check(&self) -> Result<(), DbError> {
+        match self.stopped() {
+            true => Err(named(ErrorCode::Cancelled, "the statement was cancelled")),
+            false => Ok(()),
+        }
     }
 }
 
@@ -97,6 +114,22 @@ mod tests {
     #[test]
     fn a_new_handle_is_clear() {
         assert!(!CancelHandle::new().stopped());
+    }
+
+    #[test]
+    fn a_stopped_handle_fails_a_check_until_it_is_cleared() {
+        let handle = CancelHandle::new();
+        handle.check().expect("a clear handle stops nothing");
+
+        handle.stop();
+        let e = handle.check().err().unwrap();
+        assert_eq!(e.code, ErrorCode::Cancelled);
+        assert!(e.message.contains("cancelled"), "{e}");
+
+        // One cancel stops one statement.
+        handle.clear();
+        handle.check().expect("the next statement runs");
+        assert!(!handle.stopped());
     }
 
     #[test]

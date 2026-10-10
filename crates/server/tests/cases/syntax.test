@@ -11,10 +11,7 @@ SELECT * FROM item
 statement error UNKNOWN_TABLE
 SELECT id, label FROM item WHERE id >= 2 AND label IS NOT NULL LIMIT 10
 
-# Sorting waits for the external sort, so a statement that asks for it is
-# refused rather than answered in the wrong order.
-
-statement error SYNTAX_ERROR
+statement error UNKNOWN_TABLE
 SELECT id FROM item ORDER BY label DESC
 
 statement error UNKNOWN_TABLE

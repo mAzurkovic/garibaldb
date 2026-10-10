@@ -13,9 +13,9 @@ use std::time::Duration;
 use protocol::error::ErrorCode;
 use protocol::message::ServerMsg;
 
+use crate::cancel::CancelRegistry;
 use crate::catalog::registry::{Limits, Registry};
 use crate::config::Config;
-use crate::net::cancel::CancelRegistry;
 use crate::net::session;
 
 /// The listening socket and the state that every session shares.
@@ -43,6 +43,7 @@ impl Server {
                 wal: config.wal_max_bytes,
                 checkpoint: config.checkpoint_bytes,
                 lock_timeout: Duration::from_millis(config.lock_timeout_ms),
+                sort: config.sort_bytes,
             },
         )?;
         databases.bootstrap()?;

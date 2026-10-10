@@ -1,5 +1,6 @@
 //! The `garibaldb-server` binary. See `docs/design.md`.
 
+mod cancel;
 mod catalog;
 mod config;
 mod exec;
